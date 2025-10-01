@@ -41,3 +41,4 @@ jobs:
       with:
         name: VirtualMicRelay-Windows
         path: dist/VirtualMicRelay.zip
+
