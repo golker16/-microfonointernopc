@@ -189,8 +189,11 @@ class AudioWorker(threading.Thread):
         self.stop_event.set()
 
 class _NullCtx:
-    def __enter__(self): return self
-    def __exit__(self, exc_type, exc, tb): return False
+    """Contexto nulo: devuelve None, para que el 'if mon_player:' sea False y no se llame .play()."""
+    def __enter__(self): 
+        return None
+    def __exit__(self, exc_type, exc, tb): 
+        return False
 
 # ---------- GUI ----------
 class MainWindow(QtWidgets.QMainWindow):
