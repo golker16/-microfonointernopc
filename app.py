@@ -17,7 +17,7 @@ def _compat_fromstring(s, dtype=float, count=-1, sep=''):
 np.fromstring = _compat_fromstring
 # ------------------------------------------------------------------------------
 
-# Audio backends
+# Backends de audio
 try:
     import soundcard as sc
 except Exception:
@@ -25,10 +25,8 @@ except Exception:
 
 try:
     import sounddevice as sd
-    import soundfile as sf
 except Exception:
     sd = None
-    sf = None
 
 from PySide6 import QtCore, QtGui, QtWidgets
 import qdarkstyle
@@ -72,14 +70,13 @@ def to_mono(arr: np.ndarray) -> np.ndarray:
 # ---------- Audio Worker ----------
 class AudioWorker(threading.Thread):
     """
-    Captura loopback de un altavoz (igual que CallCenter Helper) y
-    lo envía en tiempo real al altavoz virtual 'CABLE Input'.
-    Si soundcard falla, intenta fallback con sounddevice (captura del mic por defecto).
+    Captura loopback del ALTAVOZ POR DEFECTO del sistema (igual que tu proyecto)
+    y lo envía en tiempo real al altavoz virtual 'CABLE Input'.
+    Si soundcard falla, intenta fallback con sounddevice (entrada por defecto).
     """
-    def __init__(self, *, loopback_name, out_name, mix_mic_name, sr, block, mono, sys_gain, mic_gain, limiter, monitor_local=False):
+    def __init__(self, *, out_name, mix_mic_name, sr, block, mono, sys_gain, mic_gain, limiter, monitor_local=False):
         super().__init__(daemon=True, name="AudioWorker")
         self.stop_event = threading.Event()
-        self.loopback_name = loopback_name
         self.out_name = out_name
         self.mix_mic_name = mix_mic_name
         self.sr = int(sr)
@@ -89,8 +86,6 @@ class AudioWorker(threading.Thread):
         self.mic_gain = float(mic_gain)
         self.limiter = bool(limiter)
         self.monitor_local = bool(monitor_local)
-
-        # Estado fallback
         self._use_fallback = False
 
     # ---- Helpers soundcard ----
@@ -104,13 +99,11 @@ class AudioWorker(threading.Thread):
                 return s
         raise RuntimeError(f"No se encontró salida con nombre que contenga: '{name_substring}'")
 
-    def _get_loopback_mic(self):
+    def _get_default_loopback(self):
+        """Loopback del ALTAVOZ POR DEFECTO del sistema, como en tu proyecto."""
         if sc is None:
             raise RuntimeError("soundcard no disponible para loopback.")
-        if self.loopback_name and self.loopback_name.strip() and self.loopback_name != "(por defecto)":
-            spk = self._find_speaker(self.loopback_name)
-        else:
-            spk = sc.default_speaker()
+        spk = sc.default_speaker()
         mic = sc.get_microphone(spk.name, include_loopback=True)
         if mic is None:
             raise RuntimeError(f"No pude obtener loopback de: {spk.name}")
@@ -130,25 +123,24 @@ class AudioWorker(threading.Thread):
 
     # ---- Fallback con sounddevice (si no hay loopback posible) ----
     def _fallback_stream(self):
-        """Captura desde el dispositivo de entrada por defecto (mic) con sounddevice."""
+        """Captura desde el dispositivo de entrada por defecto con sounddevice."""
         if sd is None:
             raise RuntimeError("Fallback requerido pero sounddevice no está disponible.")
-        logger.warning("Usando fallback con sounddevice (mic por defecto). No es loopback del sistema.")
-        # Prepara salida con soundcard (CABLE Input) si es posible; si no, hacemos salida con sounddevice
-        out_by_sd = False
+        logger.warning("Usando fallback con sounddevice (entrada por defecto). No es loopback del sistema.")
+
+        # Intentamos reproducir al CABLE Input con soundcard; si no, salida por sounddevice.
+        player_ctx = None
+        player = None
         try:
             out_spk = self._find_speaker(self.out_name)
-            # abrimos un player con soundcard
             player_ctx = out_spk.player(samplerate=self.sr, blocksize=self.block)
             player_ctx.__enter__()
             player = player_ctx
         except Exception as e:
-            logger.error(f"No pude abrir salida con soundcard: {e}. Intentaré salida con sounddevice.")
-            out_by_sd = True
+            logger.error(f"No pude abrir salida con soundcard: {e}. Reproduciré con sounddevice.")
             player_ctx = None
             player = None
 
-        # stream de entrada SD
         def callback(indata, frames, time_info, status):
             if self.stop_event.is_set():
                 raise sd.CallbackStop()
@@ -161,10 +153,10 @@ class AudioWorker(threading.Thread):
             if player is not None:
                 player.play(x)
             else:
-                # salida sounddevice (si falló soundcard)
                 sd.play(x, samplerate=self.sr, blocking=False)
 
-        with sd.InputStream(samplerate=self.sr, channels=1 if self.mono else 2, dtype="float32", blocksize=self.block, callback=callback):
+        with sd.InputStream(samplerate=self.sr, channels=1 if self.mono else 2,
+                            dtype="float32", blocksize=self.block, callback=callback):
             while not self.stop_event.is_set():
                 time.sleep(0.05)
         if player_ctx:
@@ -175,12 +167,12 @@ class AudioWorker(threading.Thread):
         try:
             logger.info("Inicializando captura y reproducción…")
 
-            # Intenta abrir loopback + salida con soundcard
+            # Intenta abrir loopback del altavoz por defecto + salida con soundcard
             try:
-                sys_mic, src_spk_name = self._get_loopback_mic()
+                sys_mic, src_spk_name = self._get_default_loopback()
                 out_spk = self._find_speaker(self.out_name)
                 phys_mic = self._get_physical_mic(self.mix_mic_name)
-                logger.info(f"Loopback de: {src_spk_name}")
+                logger.info(f"Loopback de (por defecto): {src_spk_name}")
                 logger.info(f"Salida destino  : {out_spk.name}")
                 logger.info(f"Mic físico mix  : {phys_mic.name if phys_mic else '(ninguno)'}")
                 logger.info(f"SR={self.sr} block={self.block} mono={self.mono} "
@@ -215,13 +207,12 @@ class AudioWorker(threading.Thread):
                         sys_frames = to_mono(sys_frames)
                     sys_frames *= self.sys_gain
 
-                    # mezcla mic físico si aplica
+                    # Mezcla mic físico si aplica
                     if mic_rec:
                         mic_frames = mic_rec.record(self.block)
                         mic_frames = sanitize(mic_frames)
                         if self.mono:
                             mic_frames = to_mono(mic_frames)
-                        # emparejar canales
                         if sys_frames.shape[1] != mic_frames.shape[1]:
                             if sys_frames.shape[1] == 1 and mic_frames.shape[1] == 2:
                                 sys_frames = np.repeat(sys_frames, 2, axis=1)
@@ -238,7 +229,7 @@ class AudioWorker(threading.Thread):
                         mix[:n, :] *= fade
                         fade_left -= n
 
-                    # limiter suave
+                    # Limiter suave
                     mix = np.clip(mix, -0.98, 0.98) if self.limiter else mix
 
                     player.play(mix)
@@ -264,7 +255,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_NAME)
-        self.setMinimumSize(900, 580)
+        self.setMinimumSize(840, 560)
         self.setWindowIcon(QtGui.QIcon("assets/app.ico") if Path("assets/app.ico").exists()
                            else self.style().standardIcon(QtWidgets.QStyle.SP_MediaPlay))
 
@@ -274,11 +265,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         central = QtWidgets.QWidget(); self.setCentralWidget(central)
 
-        # Controles
-        self.loopback_combo = QtWidgets.QComboBox()   # altavoz de donde capturamos (loopback)
-        self.out_combo      = QtWidgets.QComboBox()   # destino → CABLE Input
-        self.mic_combo      = QtWidgets.QComboBox()   # mic físico (opcional)
-        self.refresh_btn    = QtWidgets.QPushButton("Actualizar dispositivos")
+        # Controles (simplificados: sin seleccionar fuente, siempre default)
+        self.out_combo   = QtWidgets.QComboBox()   # destino → CABLE Input
+        self.mic_combo   = QtWidgets.QComboBox()   # mic físico (opcional)
+        self.refresh_btn = QtWidgets.QPushButton("Actualizar dispositivos")
 
         self.sr_spin    = QtWidgets.QSpinBox(); self.sr_spin.setRange(8000, 192000); self.sr_spin.setValue(DEFAULT_SR)
         self.block_spin = QtWidgets.QSpinBox(); self.block_spin.setRange(120, 4096); self.block_spin.setValue(DEFAULT_BLOCK)
@@ -296,7 +286,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Layout
         form = QtWidgets.QFormLayout()
-        form.addRow("Fuente de loopback (capturar de):", self.loopback_combo)
         form.addRow("Salida (→ CABLE Input):", self.out_combo)
         form.addRow("Mic físico (opcional):", self.mic_combo)
 
@@ -335,13 +324,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def populate_devices(self):
         try:
-            # Loopback fuente
-            self.loopback_combo.clear()
-            loop_items = ["(por defecto)"]
-            if sc:
-                loop_items += [s.name for s in sc.all_speakers()]
-            self.loopback_combo.addItems(loop_items)
-
             # Salidas (destino → CABLE Input)
             self.out_combo.clear()
             outs = [s.name for s in sc.all_speakers()] if sc else []
@@ -369,12 +351,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_start(self):
         cfg = {
-            "loopback_name": None if self.loopback_combo.currentIndex() == 0 else self.loopback_combo.currentText(),
             "out_name": self.out_combo.currentText(),
             "mix_mic_name": None if self.mic_combo.currentIndex() == 0 else self.mic_combo.currentText(),
             "sr": self.sr_spin.value(),
             "block": self.block_spin.value(),
-            "mono": self.mono_chk.isChecked(),        # por defecto True (como tu proyecto)
+            "mono": self.mono_chk.isChecked(),        # True por defecto
             "sys_gain": self.sys_gain_d.value(),
             "mic_gain": self.mic_gain_d.value(),
             "limiter": self.limiter_chk.isChecked(),
@@ -487,7 +468,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 
 
