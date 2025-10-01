@@ -7,7 +7,6 @@ import numpy as np
 
 from PySide6 import QtCore, QtGui, QtWidgets
 import qdarkstyle
-
 import sounddevice as sd
 
 APP_NAME = "VirtualMicRelay"
@@ -15,11 +14,11 @@ LOG_DIR = Path("logs"); LOG_DIR.mkdir(exist_ok=True)
 LOG_FILE = LOG_DIR / "app.log"
 
 # ====== Parámetros por defecto ======
-DEFAULT_SR = 48000            # 48 kHz (bueno para Web/Discord)
-DEFAULT_BLOCK = 960           # ~20 ms a 48 kHz
-FORCE_STEREO = True           # fuerza 2 canales a la salida virtual
-LIMITER = True
-FADE_MS  = 120
+DEFAULT_SR    = 48000            # 48 kHz (bueno para Web/Discord)
+DEFAULT_BLOCK = 960              # ~20 ms a 48 kHz
+FORCE_STEREO  = True             # fuerza 2 canales de salida
+LIMITER       = True
+FADE_MS       = 120
 WARMUP_BLOCKS = 6
 
 # ---------- Logging ----------
@@ -44,14 +43,10 @@ def to_mono(arr: np.ndarray) -> np.ndarray:
     return arr.mean(axis=1, keepdims=True)
 
 def match_channels(x: np.ndarray, ch: int) -> np.ndarray:
-    if x.ndim == 1:
-        x = x[:, None]
-    if x.shape[1] == ch:
-        return x
-    if x.shape[1] == 1 and ch == 2:
-        return np.repeat(x, 2, axis=1)
-    if x.shape[1] == 2 and ch == 1:
-        return to_mono(x)
+    if x.ndim == 1: x = x[:, None]
+    if x.shape[1] == ch: return x
+    if x.shape[1] == 1 and ch == 2: return np.repeat(x, 2, axis=1)
+    if x.shape[1] == 2 and ch == 1: return to_mono(x)
     return x[:, :ch]
 
 # ---------- Audio Worker (WASAPI loopback → CABLE Input) ----------
@@ -60,72 +55,72 @@ class AudioWorker(QtCore.QThread):
 
     def __init__(self, out_device_name: str, sr: int, block: int, mono: bool, sys_gain: float):
         super().__init__()
-        self.out_device_name = out_device_name
+        self.out_device_name = out_device_name   # p.ej. "CABLE Input (VB-Audio Virtual Cable)"
         self.sr = int(sr)
         self.block = int(block)
         self.mono = bool(mono)
         self.sys_gain = float(sys_gain)
         self._stop = False
 
-        self._in_dev = None
-        self._out_dev = None
+        self._in_dev = None    # dict del dispositivo de salida real que usaremos como loopback (input)
+        self._out_dev = None   # dict del dispositivo de salida destino (CABLE Input)
         self._fade_left = int(self.sr * (FADE_MS / 1000.0))
 
-        # Cola entre callbacks (input produce, output consume)
-        self._q = deque(maxlen=10)
+        self._q = deque(maxlen=10)  # cola entre callbacks
+
+    def _get_wasapi_index(self):
+        for idx, api in enumerate(sd.query_hostapis()):
+            if "wasapi" in api.get("name", "").lower():
+                return idx
+        return None
 
     def _find_devices(self):
-        # 1) Host API: buscar WASAPI (usar índice de la lista)
-        hostapis = sd.query_hostapis()
-        wasapi_index = None
-        for idx, api in enumerate(hostapis):
-            if "wasapi" in api.get("name", "").lower():
-                wasapi_index = idx
-                break
+        wasapi_index = self._get_wasapi_index()
         if wasapi_index is None:
             raise RuntimeError("No encontré host API WASAPI (requerido para loopback).")
 
-        # 2) Entradas: dispositivos de *entrada* cuyo nombre incluya '(loopback)'
         devices = sd.query_devices()
-        candidates_in = []
-        for dev in devices:
-            if dev.get("hostapi") != wasapi_index:
-                continue
-            name = dev.get("name", "")
-            if dev.get("max_input_channels", 0) > 0 and "loopback" in name.lower():
-                candidates_in.append(dev)
 
-        if not candidates_in:
-            raise RuntimeError("No hay dispositivo LOOPBACK disponible (WASAPI). Revisa permisos/sonido.")
-
-        # Heurística: elegir el loopback asociado al dispositivo de salida por defecto
-        try:
-            out_idx_default = sd.default.device[1] if sd.default.device else None
-            default_out = sd.query_devices(out_idx_default) if out_idx_default is not None else None
-        except Exception:
-            default_out = None
-
-        sel_in = candidates_in[0]
-        if default_out:
-            base = default_out["name"].split(" (")[0].strip().lower()
-            for dev in candidates_in:
-                if base in dev["name"].lower():
-                    sel_in = dev; break
-
-        # 3) Salida: el dispositivo cuyo nombre contenga self.out_device_name
+        # ---- Elegir salida destino (CABLE Input) por nombre (WASAPI + output) ----
         sel_out = None
         for dev in devices:
             if dev.get("hostapi") == wasapi_index and dev.get("max_output_channels", 0) > 0:
-                if self.out_device_name.lower() in dev.get("name","").lower():
-                    sel_out = dev
-                    break
-
+                if self.out_device_name.lower() in dev.get("name", "").lower():
+                    sel_out = dev; break
         if sel_out is None:
-            raise RuntimeError(f"No encontré salida WASAPI para: {self.out_device_name}")
-
-        self._in_dev  = sel_in
+            raise RuntimeError(f"No encontré salida WASAPI que contenga: {self.out_device_name}")
         self._out_dev = sel_out
-        self.log.emit(f"Loopback: {self._in_dev['name']}  →  Salida: {self._out_dev['name']}")
+
+        # ---- Elegir FUENTE para loopback: altavoz por defecto del sistema ----
+        # Truco importante: en WASAPI puedes abrir un OutputStream como InputStream con loopback=True.
+        # Así que tomamos el dispositivo de SALIDA por defecto (o el primero de WASAPI) y lo usaremos como "input".
+        default_out_idx = None
+        try:
+            if sd.default.device and sd.default.device[1] is not None:
+                default_out_idx = sd.default.device[1]
+        except Exception:
+            default_out_idx = None
+
+        sel_in = None
+        if default_out_idx is not None:
+            try:
+                cand = sd.query_devices(default_out_idx)
+                if cand.get("hostapi") == wasapi_index and cand.get("max_output_channels", 0) > 0:
+                    sel_in = cand
+            except Exception:
+                sel_in = None
+
+        if sel_in is None:
+            # toma el primer dispositivo WASAPI que tenga salida
+            for dev in devices:
+                if dev.get("hostapi") == wasapi_index and dev.get("max_output_channels", 0) > 0:
+                    sel_in = dev; break
+
+        if sel_in is None:
+            raise RuntimeError("No hay ningún dispositivo de salida WASAPI para usar como loopback.")
+
+        self._in_dev = sel_in
+        self.log.emit(f"Loopback de: {self._in_dev['name']}  →  Salida: {self._out_dev['name']}")
 
     def _fade_apply(self, x: np.ndarray):
         if self._fade_left <= 0: 
@@ -147,14 +142,15 @@ class AudioWorker(QtCore.QThread):
             return
 
         # Ajustes WASAPI: loopback en input; shared mode para compatibilidad
-        wasapi_in = sd.WasapiSettings(loopback=True, exclusive=False)
+        wasapi_in  = sd.WasapiSettings(loopback=True,  exclusive=False)
         wasapi_out = sd.WasapiSettings(exclusive=False)
 
-        in_name  = self._in_dev["name"]
+        in_name  = self._in_dev["name"]   # ¡es un dispositivo de SALIDA, pero lo abrimos como input con loopback!
         out_name = self._out_dev["name"]
 
         channels_out = 2 if FORCE_STEREO else (1 if self.mono else min(self._out_dev["max_output_channels"], 2))
-        channels_in  = min(self._in_dev["max_input_channels"], 2)
+        # Para la fuente (que es salida), “max_output_channels” define cuántos canales puede capturar por loopback
+        channels_in  = min(self._in_dev.get("max_output_channels", 2), 2)
 
         self.log.emit(f"SR={self.sr} block={self.block} in_ch={channels_in} out_ch={channels_out} mono={self.mono}")
 
@@ -167,8 +163,7 @@ class AudioWorker(QtCore.QThread):
                 raise sd.CallbackStop()
             if status:
                 self.log.emit(f"[IN-STATUS] {status}")
-            # indata ya es ndarray float32 (frames, channels)
-            x = np.asarray(indata, dtype=np.float32)
+            x = np.asarray(indata, dtype=np.float32)     # (frames, channels_in)
             if warm > 0:
                 warm -= 1
                 return
@@ -180,7 +175,6 @@ class AudioWorker(QtCore.QThread):
             if LIMITER:
                 x = np.clip(x, -0.98, 0.98)
             x = self._fade_apply(x)
-            # Encolar copia (para que no se sobrescriba el buffer de SD)
             self._q.append(x.copy())
 
         def out_cb(outdata, frames, time_info, status):
@@ -190,7 +184,6 @@ class AudioWorker(QtCore.QThread):
                 self.log.emit(f"[OUT-STATUS] {status}")
             if self._q:
                 x = self._q.popleft()
-                # Ajustar a tamaño del frame
                 if x.shape[0] < frames:
                     pad = np.zeros((frames - x.shape[0], x.shape[1]), dtype=np.float32)
                     x = np.vstack([x, pad])
@@ -198,10 +191,11 @@ class AudioWorker(QtCore.QThread):
                     x = x[:frames]
             else:
                 x = np.zeros((frames, channels_out), dtype=np.float32)
-            # ¡Asignar el array, no bytes!
             outdata[:] = x
 
         try:
+            # OJO: abrimos InputStream con "device=in_name" (que es un dispositivo de salida)
+            # y loopback=True. Así capturamos TODO lo que suena por el altavoz por defecto.
             with sd.InputStream(device=in_name, samplerate=self.sr, dtype="float32",
                                 channels=channels_in, blocksize=self.block,
                                 callback=in_cb, extra_settings=wasapi_in):
@@ -282,24 +276,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self.populate_devices()
         QtCore.QTimer.singleShot(400, self.autostart)
 
+    def _get_wasapi_index(self):
+        for idx, api in enumerate(sd.query_hostapis()):
+            if "wasapi" in api.get("name", "").lower():
+                return idx
+        return None
+
     def populate_devices(self):
         try:
             self.out_combo.clear()
-            # Listar salidas WASAPI
             names = []
-            hostapis = sd.query_hostapis()
-            wasapi_index = None
-            for idx, api in enumerate(hostapis):
-                if "wasapi" in api.get("name", "").lower():
-                    wasapi_index = idx; break
+            wasapi_index = self._get_wasapi_index()
             if wasapi_index is None:
                 raise RuntimeError("No hay WASAPI disponible.")
-
             for dev in sd.query_devices():
                 if dev.get("hostapi") == wasapi_index and dev.get("max_output_channels", 0) > 0:
                     names.append(dev["name"])
-
-            # Prioriza VB-CABLE Input
             names = sorted(names, key=lambda n: 0 if "cable input" in n.lower() else 1)
             if not names:
                 raise RuntimeError("No hay salidas WASAPI.")
@@ -427,6 +419,7 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
 
 
