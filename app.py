@@ -1,45 +1,27 @@
 # app.py
-import os
-import sys
-import time
-import threading
-import logging
+import sys, time, logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-
-# --- Parche compat NumPy 2.x (soundcard usa fromstring binario) ----------------
 import numpy as np
-_original_fromstring = np.fromstring
-def _compat_fromstring(s, dtype=float, count=-1, sep=''):
-    if isinstance(s, (bytes, bytearray, memoryview)) and (sep == '' or sep is None):
-        return np.frombuffer(s, dtype=dtype, count=count if count != -1 else -1)
-    return _original_fromstring(s, dtype=dtype, count=count, sep=sep)
-np.fromstring = _compat_fromstring
-# ------------------------------------------------------------------------------
 
-# Backends de audio
-try:
-    import soundcard as sc
-except Exception:
-    sc = None
-
-try:
-    import sounddevice as sd
-except Exception:
-    sd = None
-
+# ---------- Dependencias GUI ----------
 from PySide6 import QtCore, QtGui, QtWidgets
 import qdarkstyle
 
-APP_NAME = "VirtualMicRelay"
-# === Defaults alineados con tu otro proyecto ===
-DEFAULT_SR = 32000         # 32 kHz como CallCenter Helper
-DEFAULT_BLOCK = 640        # ~20 ms a 32 kHz
-WARMUP_BLOCKS = 6
-FADE_MS = 120
+# ---------- Audio: SOLO sounddevice (WASAPI loopback) ----------
+import sounddevice as sd
 
+APP_NAME = "VirtualMicRelay"
 LOG_DIR = Path("logs"); LOG_DIR.mkdir(exist_ok=True)
 LOG_FILE = LOG_DIR / "app.log"
+
+# ====== Parámetros por defecto ======
+DEFAULT_SR = 48000            # 48 kHz (mejor para web/discord)
+DEFAULT_BLOCK = 960           # ~20 ms a 48 kHz (latencia estable)
+FORCE_STEREO = True           # enviar estéreo al virtual mic
+LIMITER = True
+FADE_MS  = 120
+WARMUP_BLOCKS = 6
 
 # ---------- Logging ----------
 logger = logging.getLogger(APP_NAME)
@@ -51,211 +33,186 @@ fh.setFormatter(fmt); fh.setLevel(logging.DEBUG); logger.addHandler(fh)
 ch = logging.StreamHandler(sys.stdout)
 ch.setFormatter(fmt); ch.setLevel(logging.INFO); logger.addHandler(ch)
 
-logger.info(f"NumPy={np.__version__}  soundcard={getattr(sc, '__version__', 'N/A')}  sounddevice={'OK' if sd else 'N/A'}")
+logger.info(f"sounddevice {sd.__version__}")
 
-# ---------- Utils ----------
+# ---------- Util ----------
 def sanitize(x: np.ndarray) -> np.ndarray:
     x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
     return np.clip(x, -1.0, 1.0)
-
-def make_fade_in(num_frames: int, channels: int) -> np.ndarray:
-    if num_frames <= 0: return None
-    fade = np.linspace(0.0, 1.0, num_frames, endpoint=True, dtype=np.float32)
-    return fade[:, None].repeat(channels, axis=1)
 
 def to_mono(arr: np.ndarray) -> np.ndarray:
     if arr.ndim == 1 or arr.shape[1] == 1: return arr
     return arr.mean(axis=1, keepdims=True)
 
-# ---------- Audio Worker ----------
-class AudioWorker(threading.Thread):
-    """
-    Captura loopback del ALTAVOZ POR DEFECTO del sistema (igual que tu proyecto)
-    y lo envía en tiempo real al altavoz virtual 'CABLE Input'.
-    Si soundcard falla, intenta fallback con sounddevice (entrada por defecto).
-    """
-    def __init__(self, *, out_name, mix_mic_name, sr, block, mono, sys_gain, mic_gain, limiter, monitor_local=False):
-        super().__init__(daemon=True, name="AudioWorker")
-        self.stop_event = threading.Event()
-        self.out_name = out_name
-        self.mix_mic_name = mix_mic_name
+def match_channels(x: np.ndarray, ch: int) -> np.ndarray:
+    if x.ndim == 1:
+        x = x[:, None]
+    if x.shape[1] == ch:
+        return x
+    if x.shape[1] == 1 and ch == 2:
+        return np.repeat(x, 2, axis=1)
+    if x.shape[1] == 2 and ch == 1:
+        return to_mono(x)
+    # fallback
+    return x[:, :ch]
+
+# ---------- Audio Worker (sounddevice WASAPI loopback → CABLE Input) ----------
+class AudioWorker(QtCore.QThread):
+    log = QtCore.Signal(str)
+
+    def __init__(self, out_device_name: str, sr: int, block: int, mono: bool, sys_gain: float):
+        super().__init__()
+        self.out_device_name = out_device_name
         self.sr = int(sr)
         self.block = int(block)
         self.mono = bool(mono)
         self.sys_gain = float(sys_gain)
-        self.mic_gain = float(mic_gain)
-        self.limiter = bool(limiter)
-        self.monitor_local = bool(monitor_local)
-        self._use_fallback = False
+        self._stop = False
 
-    # ---- Helpers soundcard ----
-    def _find_speaker(self, name_substring):
-        if sc is None:
-            raise RuntimeError("soundcard no está disponible.")
-        spks = sc.all_speakers()
-        logger.debug(f"Speakers: {[s.name for s in spks]}")
-        for s in spks:
-            if name_substring.lower() in s.name.lower():
-                return s
-        raise RuntimeError(f"No se encontró salida con nombre que contenga: '{name_substring}'")
+        self._in_dev = None
+        self._out_dev = None
+        self._fade_left = int(self.sr * (FADE_MS / 1000.0))
 
-    def _get_default_loopback(self):
-        """Loopback del ALTAVOZ POR DEFECTO del sistema, como en tu proyecto."""
-        if sc is None:
-            raise RuntimeError("soundcard no disponible para loopback.")
-        spk = sc.default_speaker()
-        mic = sc.get_microphone(spk.name, include_loopback=True)
-        if mic is None:
-            raise RuntimeError(f"No pude obtener loopback de: {spk.name}")
-        return mic, spk.name
+    # ---- Descubrir dispositivos en WASAPI (loopback para input) ----
+    def _find_devices(self):
+        # host WASAPI
+        api_wasapi = None
+        for api in sd.query_hostapis():
+            if "wasapi" in api["name"].lower():
+                api_wasapi = api["index"]; break
+        if api_wasapi is None:
+            raise RuntimeError("No encontré host API WASAPI (requerido para loopback).")
 
-    def _get_physical_mic(self, name_substring):
-        if not name_substring or sc is None: return None
-        mics = sc.all_microphones(include_loopback=True)
-        logger.debug(f"Microphones: {[m.name for m in mics]}")
-        for m in mics:
-            if name_substring.lower() in m.name.lower():
-                return m
-        raise RuntimeError(f"No se encontró micrófono que contenga: '{name_substring}'")
+        # Input loopback = cualquier dispositivo de salida con flag loopback
+        candidates_in = []
+        for dev in sd.query_devices():
+            if dev["hostapi"] != api_wasapi: 
+                continue
+            # En PortAudio/SD, los dispositivos loopback aparecen como entradas con "loopback" en nombre
+            name = dev["name"].lower()
+            if "loopback" in name and dev["max_input_channels"] > 0:
+                candidates_in.append(dev)
 
-    def _apply_limiter(self, x: np.ndarray, ceiling: float = 0.98) -> np.ndarray:
-        return np.clip(x, -ceiling, ceiling)
+        if not candidates_in:
+            raise RuntimeError("No hay dispositivo LOOPBACK disponible (WASAPI). Revisa permisos/sonido.")
 
-    # ---- Fallback con sounddevice (si no hay loopback posible) ----
-    def _fallback_stream(self):
-        """Captura desde el dispositivo de entrada por defecto con sounddevice."""
-        if sd is None:
-            raise RuntimeError("Fallback requerido pero sounddevice no está disponible.")
-        logger.warning("Usando fallback con sounddevice (entrada por defecto). No es loopback del sistema.")
+        # Heurística: elegir el loopback que corresponda al dispositivo de salida por defecto
+        default_out = sd.query_devices(sd.default.device[1]) if sd.default.device and sd.default.device[1] is not None else None
+        sel_in = candidates_in[0]
+        if default_out:
+            base = default_out["name"].split(" (")[0].strip().lower()
+            for dev in candidates_in:
+                if base in dev["name"].lower():
+                    sel_in = dev; break
 
-        # Intentamos reproducir al CABLE Input con soundcard; si no, salida por sounddevice.
-        player_ctx = None
-        player = None
-        try:
-            out_spk = self._find_speaker(self.out_name)
-            player_ctx = out_spk.player(samplerate=self.sr, blocksize=self.block)
-            player_ctx.__enter__()
-            player = player_ctx
-        except Exception as e:
-            logger.error(f"No pude abrir salida con soundcard: {e}. Reproduciré con sounddevice.")
-            player_ctx = None
-            player = None
+        # Output: el dispositivo cuyo nombre contenga self.out_device_name
+        sel_out = None
+        for dev in sd.query_devices():
+            if dev["hostapi"] == api_wasapi and dev["max_output_channels"] > 0:
+                if self.out_device_name.lower() in dev["name"].lower():
+                    sel_out = dev; break
 
-        def callback(indata, frames, time_info, status):
-            if self.stop_event.is_set():
-                raise sd.CallbackStop()
-            x = np.asarray(indata, dtype=np.float32)
-            if self.mono:
-                x = to_mono(x)
-            x *= self.sys_gain
-            if self.limiter:
-                x = self._apply_limiter(x)
-            if player is not None:
-                player.play(x)
-            else:
-                sd.play(x, samplerate=self.sr, blocking=False)
+        if sel_out is None:
+            raise RuntimeError(f"No encontré salida WASAPI para: {self.out_device_name}")
 
-        with sd.InputStream(samplerate=self.sr, channels=1 if self.mono else 2,
-                            dtype="float32", blocksize=self.block, callback=callback):
-            while not self.stop_event.is_set():
-                time.sleep(0.05)
-        if player_ctx:
-            player_ctx.__exit__(None, None, None)
+        self._in_dev  = sel_in
+        self._out_dev = sel_out
+        self.log.emit(f"Loopback: {self._in_dev['name']}  →  Salida: {self._out_dev['name']}")
 
-    # ---- Loop principal ----
+    def _fade_apply(self, x: np.ndarray):
+        if self._fade_left <= 0: 
+            return x
+        n = min(self._fade_left, x.shape[0])
+        fade = np.linspace(0.0, 1.0, n, endpoint=True, dtype=np.float32)
+        if x.ndim == 1:
+            x[:n] *= fade
+        else:
+            x[:n, :] *= fade[:, None]
+        self._fade_left -= n
+        return x
+
     def run(self):
         try:
-            logger.info("Inicializando captura y reproducción…")
-
-            # Intenta abrir loopback del altavoz por defecto + salida con soundcard
-            try:
-                sys_mic, src_spk_name = self._get_default_loopback()
-                out_spk = self._find_speaker(self.out_name)
-                phys_mic = self._get_physical_mic(self.mix_mic_name)
-                logger.info(f"Loopback de (por defecto): {src_spk_name}")
-                logger.info(f"Salida destino  : {out_spk.name}")
-                logger.info(f"Mic físico mix  : {phys_mic.name if phys_mic else '(ninguno)'}")
-                logger.info(f"SR={self.sr} block={self.block} mono={self.mono} "
-                            f"sys_gain={self.sys_gain} mic_gain={self.mic_gain} limiter={self.limiter}")
-            except Exception as e:
-                logger.error(f"No se pudo preparar loopback con soundcard: {e}")
-                self._use_fallback = True
-
-            if self._use_fallback:
-                self._fallback_stream()
-                logger.info("Audio detenido (fallback).")
-                return
-
-            mon_spk = sc.default_speaker() if self.monitor_local else None
-
-            with sys_mic.recorder(samplerate=self.sr, blocksize=self.block) as sys_rec, \
-                 (phys_mic.recorder(samplerate=self.sr, blocksize=self.block) if phys_mic else _NullCtx()) as mic_rec, \
-                 out_spk.player(samplerate=self.sr, blocksize=self.block) as player, \
-                 (mon_spk.player(samplerate=self.sr, blocksize=self.block) if mon_spk else _NullCtx()) as mon_player:
-
-                # Warm-up
-                for _ in range(WARMUP_BLOCKS):
-                    _ = sys_rec.record(self.block)
-
-                fade_frames = int(self.sr * (FADE_MS / 1000.0))
-                fade_left = fade_frames
-
-                while not self.stop_event.is_set():
-                    sys_frames = sys_rec.record(self.block)  # (N, ch) float32
-                    sys_frames = sanitize(sys_frames)
-                    if self.mono:
-                        sys_frames = to_mono(sys_frames)
-                    sys_frames *= self.sys_gain
-
-                    # Mezcla mic físico si aplica
-                    if mic_rec:
-                        mic_frames = mic_rec.record(self.block)
-                        mic_frames = sanitize(mic_frames)
-                        if self.mono:
-                            mic_frames = to_mono(mic_frames)
-                        if sys_frames.shape[1] != mic_frames.shape[1]:
-                            if sys_frames.shape[1] == 1 and mic_frames.shape[1] == 2:
-                                sys_frames = np.repeat(sys_frames, 2, axis=1)
-                            elif sys_frames.shape[1] == 2 and mic_frames.shape[1] == 1:
-                                mic_frames = np.repeat(mic_frames, 2, axis=1)
-                        mix = sys_frames + mic_frames * self.mic_gain
-                    else:
-                        mix = sys_frames
-
-                    # Fade-in inicial
-                    if fade_left > 0:
-                        n = min(fade_left, mix.shape[0])
-                        fade = make_fade_in(n, mix.shape[1])
-                        mix[:n, :] *= fade
-                        fade_left -= n
-
-                    # Limiter suave
-                    mix = np.clip(mix, -0.98, 0.98) if self.limiter else mix
-
-                    player.play(mix)
-                    if mon_player:
-                        mon_player.play(mix)
-
-            logger.info("Audio detenido.")
+            self._find_devices()
         except Exception as e:
-            logger.exception(f"ERROR en audio loop: {e}")
+            self.log.emit(f"[ERROR] Dispositivos: {e}")
+            return
+
+        # Ajustes WASAPI: loopback en input; shared mode para compatibilidad
+        wasapi_in = sd.WasapiSettings(loopback=True, exclusive=False)
+        wasapi_out = sd.WasapiSettings(exclusive=False)
+
+        in_name  = self._in_dev["name"]
+        out_name = self._out_dev["name"]
+
+        channels_out = 2 if FORCE_STEREO else (1 if self.mono else min(self._out_dev["max_output_channels"], 2))
+        channels_in  = min(self._in_dev["max_input_channels"], 2)
+
+        self.log.emit(f"SR={self.sr} block={self.block} in_ch={channels_in} out_ch={channels_out} mono={self.mono}")
+
+        # Warm-up simple: contaremos bloques al inicio
+        warm = WARMUP_BLOCKS
+        self._stop = False
+
+        # Buffer puente para callback pull/push
+        buf_q = []
+
+        def in_cb(indata, frames, time_info, status):
+            nonlocal warm
+            if self._stop:
+                raise sd.CallbackStop()
+            x = np.frombuffer(indata, dtype=np.float32).reshape(-1, channels_in)
+            if warm > 0:
+                warm -= 1
+                return
+            x = sanitize(x)
+            if self.mono:
+                x = to_mono(x)
+            x = match_channels(x, channels_out)
+            x *= self.sys_gain
+            if LIMITER:
+                x = np.clip(x, -0.98, 0.98)
+            x = self._fade_apply(x)
+            buf_q.append(x.copy())
+
+        def out_cb(outdata, frames, time_info, status):
+            if self._stop:
+                raise sd.CallbackStop()
+            if buf_q:
+                x = buf_q.pop(0)
+                if x.shape[0] < frames:
+                    # rellenar si sobran frames
+                    pad = np.zeros((frames - x.shape[0], x.shape[1]), dtype=np.float32)
+                    x = np.vstack([x, pad])
+                elif x.shape[0] > frames:
+                    x = x[:frames]
+            else:
+                x = np.zeros((frames, channels_out), dtype=np.float32)
+            outdata[:] = x.tobytes()
+
+        try:
+            with sd.InputStream(device=in_name, samplerate=self.sr, dtype="float32",
+                                channels=channels_in, blocksize=self.block,
+                                callback=in_cb, extra_settings=wasapi_in):
+
+                with sd.OutputStream(device=out_name, samplerate=self.sr, dtype="float32",
+                                     channels=channels_out, blocksize=self.block,
+                                     callback=out_cb, extra_settings=wasapi_out):
+                    self.log.emit("Audio en marcha (WASAPI loopback → CABLE Input).")
+                    while not self._stop:
+                        time.sleep(0.05)
+        except Exception as e:
+            self.log.emit(f"[ERROR] Audio: {e}")
 
     def stop(self):
-        self.stop_event.set()
+        self._stop = True
 
-class _NullCtx:
-    def __enter__(self): return None
-    def __exit__(self, exc_type, exc, tb): return False
-
-# ---------- GUI ----------
+# ---------- Ventana ----------
 class MainWindow(QtWidgets.QMainWindow):
-    startRequested = QtCore.Signal(dict)
-    stopRequested  = QtCore.Signal()
-
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_NAME)
-        self.setMinimumSize(840, 560)
+        self.setMinimumSize(860, 540)
         self.setWindowIcon(QtGui.QIcon("assets/app.ico") if Path("assets/app.ico").exists()
                            else self.style().standardIcon(QtWidgets.QStyle.SP_MediaPlay))
 
@@ -265,18 +222,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
         central = QtWidgets.QWidget(); self.setCentralWidget(central)
 
-        # Controles (simplificados: sin seleccionar fuente, siempre default)
-        self.out_combo   = QtWidgets.QComboBox()   # destino → CABLE Input
-        self.mic_combo   = QtWidgets.QComboBox()   # mic físico (opcional)
+        # Controles
+        self.out_combo   = QtWidgets.QComboBox()     # destino → CABLE Input
         self.refresh_btn = QtWidgets.QPushButton("Actualizar dispositivos")
 
-        self.sr_spin    = QtWidgets.QSpinBox(); self.sr_spin.setRange(8000, 192000); self.sr_spin.setValue(DEFAULT_SR)
-        self.block_spin = QtWidgets.QSpinBox(); self.block_spin.setRange(120, 4096); self.block_spin.setValue(DEFAULT_BLOCK)
-        self.mono_chk   = QtWidgets.QCheckBox("Forzar mono"); self.mono_chk.setChecked(True)   # como tu proyecto
-        self.limiter_chk= QtWidgets.QCheckBox("Limitador"); self.limiter_chk.setChecked(True)
-
-        self.sys_gain_d = QtWidgets.QDoubleSpinBox(); self.sys_gain_d.setRange(0.0, 5.0); self.sys_gain_d.setSingleStep(0.1); self.sys_gain_d.setValue(1.0)
-        self.mic_gain_d = QtWidgets.QDoubleSpinBox(); self.mic_gain_d.setRange(0.0, 5.0); self.mic_gain_d.setSingleStep(0.1); self.mic_gain_d.setValue(1.0)
+        self.sr_spin     = QtWidgets.QSpinBox();  self.sr_spin.setRange(8000, 192000); self.sr_spin.setValue(DEFAULT_SR)
+        self.block_spin  = QtWidgets.QSpinBox();  self.block_spin.setRange(120, 4096); self.block_spin.setValue(DEFAULT_BLOCK)
+        self.mono_chk    = QtWidgets.QCheckBox("Forzar mono"); self.mono_chk.setChecked(True)
+        self.sys_gain    = QtWidgets.QDoubleSpinBox(); self.sys_gain.setRange(0.0, 5.0); self.sys_gain.setSingleStep(0.1); self.sys_gain.setValue(1.0)
 
         self.start_btn   = QtWidgets.QPushButton("Iniciar")
         self.stop_btn    = QtWidgets.QPushButton("Detener"); self.stop_btn.setEnabled(False)
@@ -287,17 +240,15 @@ class MainWindow(QtWidgets.QMainWindow):
         # Layout
         form = QtWidgets.QFormLayout()
         form.addRow("Salida (→ CABLE Input):", self.out_combo)
-        form.addRow("Mic físico (opcional):", self.mic_combo)
 
         h1 = QtWidgets.QHBoxLayout()
         h1.addWidget(self.refresh_btn); h1.addStretch()
-        h1.addWidget(QtWidgets.QLabel("Sample Rate:")); h1.addWidget(self.sr_spin)
+        h1.addWidget(QtWidgets.QLabel("SR:")); h1.addWidget(self.sr_spin)
         h1.addWidget(QtWidgets.QLabel("Block:")); h1.addWidget(self.block_spin)
 
         h2 = QtWidgets.QHBoxLayout()
-        h2.addWidget(self.mono_chk); h2.addWidget(self.limiter_chk); h2.addStretch()
-        h2.addWidget(QtWidgets.QLabel("Ganancia sistema:")); h2.addWidget(self.sys_gain_d)
-        h2.addWidget(QtWidgets.QLabel("Ganancia mic:")); h2.addWidget(self.mic_gain_d)
+        h2.addWidget(self.mono_chk); h2.addStretch()
+        h2.addWidget(QtWidgets.QLabel("Ganancia:")); h2.addWidget(self.sys_gain)
 
         h3 = QtWidgets.QHBoxLayout()
         h3.addWidget(self.start_btn); h3.addWidget(self.stop_btn); h3.addStretch(); h3.addWidget(self.open_logs_btn)
@@ -312,91 +263,85 @@ class MainWindow(QtWidgets.QMainWindow):
         self.start_btn.clicked.connect(self._on_start)
         self.stop_btn.clicked.connect(self._on_stop)
         self.open_logs_btn.clicked.connect(self.open_logs)
-        self.startRequested.connect(self.start_worker)
-        self.stopRequested.connect(self.stop_worker)
 
         # Bandeja
         self._init_tray()
 
-        # Carga inicial + autostart
+        # Carga + autostart
         self.populate_devices()
-        QtCore.QTimer.singleShot(500, self.autostart)
+        QtCore.QTimer.singleShot(400, self.autostart)
 
     def populate_devices(self):
         try:
-            # Salidas (destino → CABLE Input)
             self.out_combo.clear()
-            outs = [s.name for s in sc.all_speakers()] if sc else []
-            outs_sorted = sorted(outs, key=lambda n: 0 if "cable input" in n.lower() else 1)
-            self.out_combo.addItems(outs_sorted)
-
-            # Mics físicos
-            self.mic_combo.clear(); self.mic_combo.addItem("(ninguno)")
-            if sc:
-                mics = [m.name for m in sc.all_microphones(include_loopback=True)]
-                self.mic_combo.addItems(mics)
-
+            # Listar dispositivos WASAPI de salida
+            names = []
+            for dev in sd.query_devices():
+                try:
+                    api = sd.query_hostapis()[dev["hostapi"]]["name"].lower()
+                except Exception:
+                    api = ""
+                if "wasapi" in api and dev["max_output_channels"] > 0:
+                    names.append(dev["name"])
+            # Prioriza VB-CABLE Input
+            names = sorted(names, key=lambda n: 0 if "cable input" in n.lower() else 1)
+            if not names:
+                raise RuntimeError("No hay salidas WASAPI disponibles.")
+            self.out_combo.addItems(names)
             logger.info("Dispositivos actualizados.")
         except Exception as e:
             logger.exception(f"No se pudieron listar dispositivos: {e}")
             QtWidgets.QMessageBox.critical(self, "Error", f"Error al listar dispositivos:\n{e}")
 
     def autostart(self):
-        chosen_out = self.out_combo.currentText()
-        if "cable input" not in (chosen_out or "").lower():
+        chosen_out = self.out_combo.currentText() or ""
+        if "cable input" not in chosen_out.lower():
             QtWidgets.QMessageBox.critical(self, "VB-CABLE no detectado",
-                "No encontré 'CABLE Input (VB-Audio Virtual Cable)' como salida.\n"
-                "Instálalo y reinicia Windows, o selecciónalo en 'Salida' manualmente.")
+                "Selecciona 'CABLE Input (VB-Audio Virtual Cable)' como salida.\n"
+                "En el navegador/Discord elige 'CABLE Output' como micrófono.")
         self._on_start()
 
     def _on_start(self):
-        cfg = {
-            "out_name": self.out_combo.currentText(),
-            "mix_mic_name": None if self.mic_combo.currentIndex() == 0 else self.mic_combo.currentText(),
-            "sr": self.sr_spin.value(),
-            "block": self.block_spin.value(),
-            "mono": self.mono_chk.isChecked(),        # True por defecto
-            "sys_gain": self.sys_gain_d.value(),
-            "mic_gain": self.mic_gain_d.value(),
-            "limiter": self.limiter_chk.isChecked(),
-            "monitor_local": False,                    # evita feedback
-        }
-        logger.info("Start solicitado por la app (auto/usuario).")
-        self.startRequested.emit(cfg)
-
-    def _on_stop(self):
-        self.stopRequested.emit()
-
-    @QtCore.Slot(dict)
-    def start_worker(self, cfg):
         try:
-            if self.worker and self.worker.is_alive():
+            if self.worker and self.worker.isRunning():
                 QtWidgets.QMessageBox.information(self, "Info", "El audio ya está en ejecución.")
                 return
-            self.worker = AudioWorker(**cfg)
+            out_name = self.out_combo.currentText()
+            self.worker = AudioWorker(
+                out_device_name=out_name,
+                sr=self.sr_spin.value(),
+                block=self.block_spin.value(),
+                mono=self.mono_chk.isChecked(),
+                sys_gain=self.sys_gain.value(),
+            )
+            self.worker.log.connect(self._append_log)
             self.worker.start()
-            time.sleep(0.25)
-            self.is_running = self.worker.is_alive()
-            if not self.is_running:
-                logger.error("El worker no quedó en ejecución. Revisa logs.")
-                QtWidgets.QMessageBox.critical(self, "Error", "No se pudo iniciar el audio. Revisa los logs.")
-                self.worker = None; return
-            self.start_btn.setEnabled(False); self.stop_btn.setEnabled(True)
-            self._tray_set_tooltip(running=True)
-            logger.info("Audio iniciado.")
+            QtCore.QTimer.singleShot(250, self._post_start_check)
         except Exception as e:
             logger.exception(f"Fallo al lanzar worker: {e}")
             QtWidgets.QMessageBox.critical(self, "Error", f"No se pudo iniciar el audio:\n{e}")
 
-    @QtCore.Slot()
-    def stop_worker(self):
+    def _post_start_check(self):
+        if self.worker and self.worker.isRunning():
+            self.is_running = True
+            self.start_btn.setEnabled(False)
+            self.stop_btn.setEnabled(True)
+            self._tray_set_tooltip(True)
+            logger.info("Audio iniciado (WASAPI loopback).")
+        else:
+            self.is_running = False
+            self._tray_set_tooltip(False)
+            QtWidgets.QMessageBox.critical(self, "Error", "No se pudo iniciar el audio. Revisa los logs.")
+
+    def _on_stop(self):
         if self.worker:
             self.worker.stop()
-            self.worker.join(timeout=2.0)
+            self.worker.wait(2000)
             self.worker = None
         self.is_running = False
-        self.start_btn.setEnabled(True); self.stop_btn.setEnabled(False)
-        self._tray_set_tooltip(running=False)
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self._tray_set_tooltip(False)
         logger.info("Audio detenido por el usuario.")
 
     def open_logs(self):
@@ -406,14 +351,17 @@ class MainWindow(QtWidgets.QMainWindow):
             logger.exception(f"No se pudieron abrir logs: {e}")
             QtWidgets.QMessageBox.critical(self, "Error", f"No se pudieron abrir los logs:\n{e}")
 
-    # --- Bandeja ---
+    def _append_log(self, msg: str):
+        logger.info(msg)
+
+    # ---- Bandeja ----
     def _init_tray(self):
         self.tray = QtWidgets.QSystemTrayIcon(self)
         icon = QtGui.QIcon("assets/app.ico") if Path("assets/app.ico").exists() else self.windowIcon()
         self.tray.setIcon(icon); self.tray.setVisible(True); self._tray_set_tooltip(False)
         menu = QtWidgets.QMenu()
         self.action_show = menu.addAction("Mostrar ventana")
-        self.action_toggle = menu.addAction("Iniciar")
+        self.action_toggle = menu.addAction("Iniciar/Detener")
         self.action_logs = menu.addAction("Abrir logs")
         menu.addSeparator()
         self.action_quit = menu.addAction("Salir")
@@ -427,8 +375,6 @@ class MainWindow(QtWidgets.QMainWindow):
     def _tray_set_tooltip(self, running: bool):
         state = "En ejecución" if running else "Detenido"
         self.tray.setToolTip(f"{APP_NAME} - {state}")
-        if self.tray.contextMenu():
-            self.tray.contextMenu().actions()[1].setText("Detener" if running else "Iniciar")
 
     def _tray_show_window(self):
         self.showNormal(); self.activateWindow(); self.raise_()
@@ -439,7 +385,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _tray_quit(self):
         try:
-            if self.is_running: self.stop_worker()
+            if self.is_running: self._on_stop()
         finally:
             QtWidgets.QApplication.quit()
 
@@ -452,22 +398,20 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.tray and self.tray.isVisible():
             event.ignore()
             self.hide()
-            self.tray.showMessage(APP_NAME, "Sigo ejecutándome en segundo plano.", QtWidgets.QSystemTrayIcon.Information, 2500)
+            self.tray.showMessage(APP_NAME, "Sigo ejecutándome en segundo plano.",
+                                  QtWidgets.QSystemTrayIcon.Information, 2500)
         else:
             super().closeEvent(event)
 
 def main():
-    try:
-        app = QtWidgets.QApplication(sys.argv)
-        app.setStyleSheet(qdarkstyle.load_stylesheet(qt_api='pyside6'))
-        mw = MainWindow(); mw.show()
-        sys.exit(app.exec())
-    except Exception as e:
-        logger.exception(f"Fallo crítico al iniciar la app: {e}")
-        raise
+    app = QtWidgets.QApplication(sys.argv)
+    app.setStyleSheet(qdarkstyle.load_stylesheet(qt_api='pyside6'))
+    w = MainWindow(); w.show()
+    return app.exec()
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
+
 
 
 
