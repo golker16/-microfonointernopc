@@ -50,7 +50,6 @@ def match_channels(x: np.ndarray, ch: int) -> np.ndarray:
     return x[:, :ch]
 
 def rms_dbfs(x: np.ndarray, eps: float = 1e-12) -> float:
-    """Devuelve RMS en dBFS (0 dBFS = 1.0)."""
     if x.size == 0: return -120.0
     r = float(np.sqrt(np.mean(np.square(x), dtype=np.float64)))
     return 20.0 * math.log10(max(r, eps))
@@ -85,11 +84,12 @@ class AudioWorker(QtCore.QThread):
         self.sys_gain = float(sys_gain)
         self._stop = False
 
-        self._in_dev = None    # dict del dispositivo de salida real (usado como loopback input)
-        self._out_dev = None   # dict del dispositivo de salida destino (CABLE Input)
-        self._fade_left = int(self.sr * (FADE_MS / 1000.0))
+        # Diccionarios completos + índices reales de PortAudio
+        self._in_dev = None;   self._in_idx = None
+        self._out_dev = None;  self._out_idx = None
 
-        self._q = deque(maxlen=10)  # cola entre callbacks
+        self._fade_left = int(self.sr * (FADE_MS / 1000.0))
+        self._q = deque(maxlen=10)
 
     def _get_wasapi_index(self):
         for idx, api in enumerate(sd.query_hostapis()):
@@ -104,17 +104,18 @@ class AudioWorker(QtCore.QThread):
 
         devices = sd.query_devices()
 
-        # ---- Salida destino (CABLE Input) por nombre (WASAPI + output) ----
-        sel_out = None
-        for dev in devices:
+        # ---- Salida destino (CABLE Input) por nombre → obtener ÍNDICE ----
+        sel_out_idx = None; sel_out = None
+        for i, dev in enumerate(devices):
             if dev.get("hostapi") == wasapi_index and dev.get("max_output_channels", 0) > 0:
                 if self.out_device_name.lower() in dev.get("name", "").lower():
-                    sel_out = dev; break
-        if sel_out is None:
+                    sel_out_idx = i; sel_out = dev; break
+        if sel_out_idx is None:
             raise RuntimeError(f"No encontré salida WASAPI que contenga: {self.out_device_name}")
+        self._out_idx = sel_out_idx
         self._out_dev = sel_out
 
-        # ---- Fuente loopback: altavoz por defecto del sistema (abriremos como input con loopback=True) ----
+        # ---- Fuente loopback: altavoz por defecto del sistema → ÍNDICE de salida ----
         default_out_idx = None
         try:
             if sd.default.device and sd.default.device[1] is not None:
@@ -122,25 +123,27 @@ class AudioWorker(QtCore.QThread):
         except Exception:
             default_out_idx = None
 
-        sel_in = None
+        sel_in_idx = None; sel_in = None
         if default_out_idx is not None:
             try:
                 cand = sd.query_devices(default_out_idx)
                 if cand.get("hostapi") == wasapi_index and cand.get("max_output_channels", 0) > 0:
-                    sel_in = cand
+                    sel_in_idx = default_out_idx; sel_in = cand
             except Exception:
-                sel_in = None
+                sel_in_idx = None; sel_in = None
 
-        if sel_in is None:
-            # toma el primero WASAPI que tenga salida (como plan B)
-            for dev in devices:
+        if sel_in_idx is None:
+            # toma el primero WASAPI que tenga salida
+            for i, dev in enumerate(devices):
                 if dev.get("hostapi") == wasapi_index and dev.get("max_output_channels", 0) > 0:
-                    sel_in = dev; break
+                    sel_in_idx = i; sel_in = dev; break
 
-        if sel_in is None:
+        if sel_in_idx is None:
             raise RuntimeError("No hay ningún dispositivo de salida WASAPI para usar como loopback.")
 
+        self._in_idx = sel_in_idx
         self._in_dev = sel_in
+
         self.log.emit(f"Loopback de: {self._in_dev['name']}  →  Salida: {self._out_dev['name']}")
 
     def _fade_apply(self, x: np.ndarray):
@@ -163,15 +166,15 @@ class AudioWorker(QtCore.QThread):
             self.log.emit(f"[ERROR] Dispositivos: {e}")
             return
 
-        # Ajustes WASAPI: loopback en input; shared mode para compatibilidad
         wasapi_in  = sd.WasapiSettings(loopback=True,  exclusive=False)
         wasapi_out = sd.WasapiSettings(exclusive=False)
 
-        in_name  = self._in_dev["name"]   # es un dispositivo de SALIDA, abierto como input con loopback
-        out_name = self._out_dev["name"]
+        # ¡Usar ÍNDICES!
+        in_idx  = self._in_idx    # salida física (pero la abrimos como input con loopback=True)
+        out_idx = self._out_idx   # CABLE Input
 
         channels_out = 2 if FORCE_STEREO else (1 if self.mono else min(self._out_dev["max_output_channels"], 2))
-        channels_in  = min(self._in_dev.get("max_output_channels", 2), 2)
+        channels_in  = min(self._in_dev.get("max_output_channels", 2), 2)  # loopback de salida → usa max_output_channels
 
         self.log.emit(f"SR={self.sr} block={self.block} in_ch={channels_in} out_ch={channels_out} mono={self.mono}")
 
@@ -184,7 +187,7 @@ class AudioWorker(QtCore.QThread):
                 raise sd.CallbackStop()
             if status:
                 self.log.emit(f"[IN-STATUS] {status}")
-            x = np.asarray(indata, dtype=np.float32)     # (frames, channels_in)
+            x = np.asarray(indata, dtype=np.float32)
             if warm > 0:
                 warm -= 1
                 return
@@ -196,10 +199,8 @@ class AudioWorker(QtCore.QThread):
             if LIMITER:
                 x = np.clip(x, -0.98, 0.98)
             x = self._fade_apply(x)
-            # Nivel:
             try:
-                db = rms_dbfs(x)
-                self.level.emit(db)
+                self.level.emit(rms_dbfs(x))
             except Exception:
                 pass
             self._q.append(x.copy())
@@ -221,11 +222,11 @@ class AudioWorker(QtCore.QThread):
             outdata[:] = x
 
         try:
-            with sd.InputStream(device=in_name, samplerate=self.sr, dtype="float32",
+            with sd.InputStream(device=in_idx, samplerate=self.sr, dtype="float32",
                                 channels=channels_in, blocksize=self.block,
                                 callback=in_cb, extra_settings=wasapi_in):
 
-                with sd.OutputStream(device=out_name, samplerate=self.sr, dtype="float32",
+                with sd.OutputStream(device=out_idx, samplerate=self.sr, dtype="float32",
                                      channels=channels_out, blocksize=self.block,
                                      callback=out_cb, extra_settings=wasapi_out):
                     self.log.emit("Audio en marcha (WASAPI loopback → CABLE Input).")
@@ -233,7 +234,7 @@ class AudioWorker(QtCore.QThread):
                         time.sleep(0.05)
         except Exception as e:
             dump_devices_to_log()
-            self.log.emit(f"[ERROR] Audio: {e}")
+            self.log.emit(f"[ERROR] Audio: {repr(e)}")
 
     def stop(self):
         self._stop = True
@@ -266,7 +267,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stop_btn      = QtWidgets.QPushButton("Detener"); self.stop_btn.setEnabled(False)
         self.open_logs_btn = QtWidgets.QPushButton("Abrir logs")
         self.test_tone_btn = QtWidgets.QPushButton("Tono de prueba (440 Hz)")
-        # Medidor de nivel
         self.level_label   = QtWidgets.QLabel("Nivel: — dBFS")
         self.level_bar     = QtWidgets.QProgressBar(); self.level_bar.setRange(0, 100); self.level_bar.setValue(0)
         self.level_bar.setTextVisible(False)
@@ -326,9 +326,10 @@ class MainWindow(QtWidgets.QMainWindow):
             wasapi_index = self._get_wasapi_index()
             if wasapi_index is None:
                 raise RuntimeError("No hay WASAPI disponible.")
-            for dev in sd.query_devices():
+            for i, dev in enumerate(sd.query_devices()):
                 if dev.get("hostapi") == wasapi_index and dev.get("max_output_channels", 0) > 0:
-                    names.append(dev["name"])
+                    names.append(f"#{i}  {dev['name']}")
+            # Prioriza VB-CABLE Input
             names = sorted(names, key=lambda n: 0 if "cable input" in n.lower() else 1)
             if not names:
                 raise RuntimeError("No hay salidas WASAPI.")
@@ -338,9 +339,15 @@ class MainWindow(QtWidgets.QMainWindow):
             logger.exception(f"No se pudieron listar dispositivos: {e}")
             QtWidgets.QMessageBox.critical(self, "Error", f"Error al listar dispositivos:\n{e}")
 
+    def _extract_out_name(self):
+        txt = self.out_combo.currentText()
+        # Permite que el usuario vea "#idx  name", pero pasamos el name completo al worker
+        # El worker buscará por name para obtener el índice real nuevamente (consistente).
+        return txt.split("  ", 1)[1] if "  " in txt else txt
+
     def autostart(self):
-        chosen_out = self.out_combo.currentText() or ""
-        if "cable input" not in chosen_out.lower():
+        chosen_out = self._extract_out_name().lower()
+        if "cable input" not in chosen_out:
             QtWidgets.QMessageBox.critical(self, "VB-CABLE no detectado",
                 "Selecciona 'CABLE Input (VB-Audio Virtual Cable)' como salida.\n"
                 "En el navegador/Discord elige 'CABLE Output' como micrófono.")
@@ -351,7 +358,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if self.worker and self.worker.isRunning():
                 QtWidgets.QMessageBox.information(self, "Info", "El audio ya está en ejecución.")
                 return
-            out_name = self.out_combo.currentText()
+            out_name = self._extract_out_name()
             self.worker = AudioWorker(
                 out_device_name=out_name,
                 sr=self.sr_spin.value(),
@@ -362,7 +369,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.worker.log.connect(self._append_log)
             self.worker.level.connect(self._update_level)
             self.worker.start()
-            QtCore.QTimer.singleShot(250, self._post_start_check)
+            QtCore.QTimer.singleShot(350, self._post_start_check)
         except Exception as e:
             logger.exception(f"Fallo al lanzar worker: {e}")
             QtWidgets.QMessageBox.critical(self, "Error", f"No se pudo iniciar el audio:\n{e}")
@@ -377,7 +384,7 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.is_running = False
             self._tray_set_tooltip(False)
-            QtWidgets.QMessageBox.critical(self, "Error", "No se pudo iniciar el audio. Revisa los logs.")
+            QtWidgets.QMessageBox.critical(self, "Error", "No se pudo iniciar el audio. Revisa los logs (tabla con índices).")
 
     def _on_stop(self):
         if self.worker:
@@ -392,14 +399,12 @@ class MainWindow(QtWidgets.QMainWindow):
         logger.info("Audio detenido por el usuario.")
 
     def _update_level(self, dbfs: float):
-        # Mapear [-60, 0] dBFS a [0, 100]
         clipped = max(min(dbfs, 0.0), -60.0)
         val = int((clipped + 60.0) * (100.0 / 60.0))
         self.level_bar.setValue(val)
         self.level_label.setText(f"Nivel: {dbfs:.1f} dBFS")
 
     def _play_test_tone(self):
-        # 440 Hz, -12 dBFS, 2 s al altavoz por defecto (así el loopback lo “oye”)
         sr = self.sr_spin.value()
         dur = 2.0
         t = np.linspace(0, dur, int(sr*dur), endpoint=False, dtype=np.float32)
@@ -408,7 +413,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if FORCE_STEREO:
             tone = np.stack([tone, tone], axis=1)
         try:
-            sd.play(tone, samplerate=sr, blocking=False)  # al default output
+            sd.play(tone, samplerate=sr, blocking=False)  # al altavoz por defecto
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Error", f"No pude reproducir tono de prueba:\n{e}")
 
@@ -483,7 +488,5 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
 
 
