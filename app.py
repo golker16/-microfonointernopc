@@ -13,9 +13,8 @@ APP_NAME = "VirtualMicRelay"
 LOG_DIR = Path("logs"); LOG_DIR.mkdir(exist_ok=True)
 LOG_FILE = LOG_DIR / "app.log"
 
-# ====== Parámetros por defecto (el SR ahora es "sugerido") ======
 SUGGESTED_SR  = 48000
-DEFAULT_BLOCK = 960          # ≈20 ms @48k. Cambia en UI si hace falta.
+DEFAULT_BLOCK = 960
 FORCE_STEREO  = True
 LIMITER       = True
 FADE_MS       = 120
@@ -33,7 +32,7 @@ ch.setFormatter(fmt); ch.setLevel(logging.INFO); logger.addHandler(ch)
 
 logger.info(f"sounddevice {sd.__version__}")
 
-# ---------- Util ----------
+# ---------- Utils ----------
 def sanitize(x: np.ndarray) -> np.ndarray:
     x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
     return np.clip(x, -1.0, 1.0)
@@ -71,10 +70,19 @@ def dump_devices_to_log():
     except Exception as e:
         logger.exception(f"No pude listar dispositivos: {e}")
 
-# ---------- Audio Worker (WASAPI loopback → CABLE Input) ----------
+def has_wasapi_loopback_support() -> bool:
+    # En tu 0.5.2 lanza TypeError por 'loopback'
+    try:
+        _ = sd.WasapiSettings(exclusive=False)  # existe la clase
+        # pero NO intentemos pasar loopback aquí, porque en tu versión no existe
+        return False
+    except Exception:
+        return False
+
+# ---------- Audio Worker ----------
 class AudioWorker(QtCore.QThread):
     log   = QtCore.Signal(str)
-    level = QtCore.Signal(float)   # dBFS
+    level = QtCore.Signal(float)
 
     def __init__(self, out_device_name: str, block: int, mono: bool, sys_gain: float):
         super().__init__()
@@ -84,185 +92,177 @@ class AudioWorker(QtCore.QThread):
         self.sys_gain = float(sys_gain)
         self._stop = False
 
-        # Diccionarios + índices reales de PortAudio
-        self._in_dev = None;   self._in_idx = None
-        self._out_dev = None;  self._out_idx = None
-
+        self._in_idx = None; self._in_dev = None
+        self._out_idx = None; self._out_dev = None
         self._sr_in_use = None
         self._fade_left = 0
         self._q = deque(maxlen=10)
 
-    # ---- WASAPI helpers ----
+        self._use_wasapi_loopback = has_wasapi_loopback_support()
+
     def _get_wasapi_index(self):
         for idx, api in enumerate(sd.query_hostapis()):
-            if "wasapi" in api.get("name", "").lower():
+            if "wasapi" in api.get("name","").lower():
                 return idx
         return None
 
-    def _find_devices(self):
-        wasapi_index = self._get_wasapi_index()
-        if wasapi_index is None:
-            raise RuntimeError("No encontré host API WASAPI (requerido para loopback).")
+    def _find_cable_output_index(self):
+        # Buscamos "CABLE Input" en cualquier hostapi que tenga salida
+        for i, dev in enumerate(sd.query_devices()):
+            if dev.get("max_output_channels", 0) > 0:
+                if "cable input" in dev.get("name","").lower():
+                    return i, dev
+        return None, None
 
-        devices = sd.query_devices()
+    def _find_stereo_mix_index(self):
+        # Candidatos de mezcla física (input)
+        keys = ["stereo mix", "mezcla estéreo", "what u hear", "loopback", "stereomix", "stereo-mix"]
+        for i, dev in enumerate(sd.query_devices()):
+            if dev.get("max_input_channels", 0) > 0:
+                name = dev.get("name","").lower()
+                if any(k in name for k in keys):
+                    return i, dev
+        return None, None
 
-        # Salida destino (CABLE Input) por nombre → índice
-        sel_out_idx = sel_out = None
-        for i, dev in enumerate(devices):
-            if dev.get("hostapi") == wasapi_index and dev.get("max_output_channels", 0) > 0:
-                if self.out_device_name.lower() in dev.get("name", "").lower():
-                    sel_out_idx, sel_out = i, dev; break
-        if sel_out_idx is None:
-            raise RuntimeError(f"No encontré salida WASAPI que contenga: {self.out_device_name}")
-        self._out_idx, self._out_dev = sel_out_idx, sel_out
-
-        # Fuente loopback: altavoz por defecto (salida) → índice
-        default_out_idx = None
+    def _find_default_output_index_any(self):
+        # Por si hiciera falta (no usamos loopback en tu versión, pero lo dejo)
         try:
             if sd.default.device and sd.default.device[1] is not None:
-                default_out_idx = sd.default.device[1]
+                return sd.default.device[1], sd.query_devices(sd.default.device[1])
         except Exception:
-            default_out_idx = None
+            pass
+        # fallback: primera salida que encontremos
+        for i, dev in enumerate(sd.query_devices()):
+            if dev.get("max_output_channels", 0) > 0:
+                return i, dev
+        return None, None
 
-        sel_in_idx = sel_in = None
-        if default_out_idx is not None:
-            try:
-                cand = sd.query_devices(default_out_idx)
-                if cand.get("hostapi") == wasapi_index and cand.get("max_output_channels", 0) > 0:
-                    sel_in_idx, sel_in = default_out_idx, cand
-            except Exception:
-                sel_in_idx = sel_in = None
+    def _choose_devices(self):
+        # Salida: CABLE Input
+        out_idx, out_dev = self._find_cable_output_index()
+        if out_idx is None:
+            raise RuntimeError("No encontré 'CABLE Input (VB-Audio Virtual Cable)'. Instálalo y reinicia Windows.")
+        self._out_idx, self._out_dev = out_idx, out_dev
 
-        if sel_in_idx is None:
-            for i, dev in enumerate(devices):
-                if dev.get("hostapi") == wasapi_index and dev.get("max_output_channels", 0) > 0:
-                    sel_in_idx, sel_in = i, dev; break
-        if sel_in_idx is None:
-            raise RuntimeError("No hay dispositivo de salida WASAPI para usar como loopback.")
+        # Entrada:
+        if self._use_wasapi_loopback:
+            # (no se usará en tu 0.5.2, pero dejamos el camino)
+            idx, dev = self._find_default_output_index_any()
+            if idx is None:
+                raise RuntimeError("No encontré salida por defecto para usar como loopback.")
+            self._in_idx, self._in_dev = idx, dev
+            self.log.emit(f"Loopback (WASAPI) de salida idx #{idx}: {dev['name']}")
+        else:
+            # Usar fuente física tipo "Mezcla estéreo"
+            idx, dev = self._find_stereo_mix_index()
+            if idx is None:
+                raise RuntimeError("No encontré 'Stereo Mix / Mezcla estéreo'. Actívalo en Panel de control → Sonido → Grabación.")
+            self._in_idx, self._in_dev = idx, dev
+            self.log.emit(f"Fuente: {dev['name']}  →  Salida: {out_dev['name']}")
 
-        self._in_idx, self._in_dev = sel_in_idx, sel_in
-        self.log.emit(f"Loopback de: {self._in_dev['name']}  →  Salida: {self._out_dev['name']}")
-
-    # ---- Intento robusto de abrir streams con varias combinaciones ----
-    def _open_streams_robusto(self):
-        # Candidatos de SR: sugerido + defaults de dispositivos + fallback
+    def _open_streams(self):
+        # Negociar SR: sugerido → default de in/out → 44100 → 48000
         sr_candidates = []
         seen = set()
         for sr in [SUGGESTED_SR,
-                   int(self._out_dev.get("default_samplerate") or 0),
                    int(self._in_dev.get("default_samplerate") or 0),
-                   44100, 48000, 32000]:
+                   int(self._out_dev.get("default_samplerate") or 0),
+                   44100, 48000]:
             if sr and sr not in seen:
                 seen.add(sr); sr_candidates.append(sr)
 
-        # Modos: primero compartido, luego exclusivo
-        mode_candidates = [
-            dict(in_excl=False, out_excl=False),
-            dict(in_excl=True,  out_excl=False),
-            dict(in_excl=False, out_excl=True),
-            dict(in_excl=True,  out_excl=True),
-        ]
-
-        # Canales
-        ch_out = 2 if FORCE_STEREO else min(self._out_dev.get("max_output_channels", 2), 2)
-        ch_in  = min(self._in_dev.get("max_output_channels", 2), 2)
+        ch_out = 2 if FORCE_STEREO else min(self._out_dev.get("max_output_channels",2), 2)
+        # Si usamos Stereo Mix como **input**, sus canales son "max_input_channels"
+        ch_in  = min(self._in_dev.get("max_input_channels", 2), 2) if not self._use_wasapi_loopback \
+                 else min(self._in_dev.get("max_output_channels", 2), 2)
 
         last_error = None
         for sr in sr_candidates:
-            for mode in mode_candidates:
-                try:
-                    was_in  = sd.WasapiSettings(loopback=True,  exclusive=mode["in_excl"])
-                    was_out = sd.WasapiSettings(exclusive=mode["out_excl"])
+            try:
+                warm = WARMUP_BLOCKS
+                self._fade_left = int(sr * (FADE_MS / 1000.0))
+                self._sr_in_use = sr
 
-                    # warm-up counter y fade para cada inicio
-                    warm = WARMUP_BLOCKS
-                    self._fade_left = int(sr * (FADE_MS / 1000.0))
-                    self._sr_in_use = sr
+                def in_cb(indata, frames, time_info, status):
+                    nonlocal warm
+                    if self._stop:
+                        raise sd.CallbackStop()
+                    if status:
+                        self.log.emit(f"[IN-STATUS] {status}")
+                    x = np.asarray(indata, dtype=np.float32)
+                    if warm > 0:
+                        warm -= 1
+                        return
+                    x = sanitize(x)
+                    if self.mono: x = to_mono(x)
+                    if x.shape[1] != ch_out: x = match_channels(x, ch_out)
+                    x *= self.sys_gain
+                    if LIMITER: x = np.clip(x, -0.98, 0.98)
+                    n = min(self._fade_left, x.shape[0])
+                    if n > 0:
+                        fade = np.linspace(0.0, 1.0, n, endpoint=True, dtype=np.float32)
+                        if x.ndim == 1: x[:n] *= fade
+                        else: x[:n, :] *= fade[:, None]
+                        self._fade_left -= n
+                    try: self.level.emit(rms_dbfs(x))
+                    except Exception: pass
+                    self._q.append(x.copy())
 
-                    def in_cb(indata, frames, time_info, status):
-                        nonlocal warm
-                        if self._stop:
-                            raise sd.CallbackStop()
-                        if status:
-                            self.log.emit(f"[IN-STATUS] {status}")
-                        x = np.asarray(indata, dtype=np.float32)
-                        if warm > 0:
-                            warm -= 1
-                            return
-                        x = sanitize(x)
-                        if self.mono:
-                            x = to_mono(x)
-                        if x.shape[1] != ch_out:
-                            x = match_channels(x, ch_out)
-                        x *= self.sys_gain
-                        if LIMITER:
-                            x = np.clip(x, -0.98, 0.98)
-                        # fade-in
-                        n = min(self._fade_left, x.shape[0])
-                        if n > 0:
-                            fade = np.linspace(0.0, 1.0, n, endpoint=True, dtype=np.float32)
-                            if x.ndim == 1: x[:n] *= fade
-                            else:           x[:n, :] *= fade[:, None]
-                            self._fade_left -= n
-                        # nivel:
-                        try:
-                            self.level.emit(rms_dbfs(x))
-                        except Exception:
-                            pass
-                        self._q.append(x.copy())
+                def out_cb(outdata, frames, time_info, status):
+                    if self._stop:
+                        raise sd.CallbackStop()
+                    if status:
+                        self.log.emit(f"[OUT-STATUS] {status}")
+                    if self._q:
+                        b = self._q.popleft()
+                        if b.shape[0] < frames:
+                            pad = np.zeros((frames - b.shape[0], b.shape[1]), dtype=np.float32)
+                            b = np.vstack([b, pad])
+                        elif b.shape[0] > frames:
+                            b = b[:frames]
+                    else:
+                        b = np.zeros((frames, ch_out), dtype=np.float32)
+                    outdata[:] = b
 
-                    def out_cb(outdata, frames, time_info, status):
-                        if self._stop:
-                            raise sd.CallbackStop()
-                        if status:
-                            self.log.emit(f"[OUT-STATUS] {status}")
-                        if self._q:
-                            b = self._q.popleft()
-                            if b.shape[0] < frames:
-                                pad = np.zeros((frames - b.shape[0], b.shape[1]), dtype=np.float32)
-                                b = np.vstack([b, pad])
-                            elif b.shape[0] > frames:
-                                b = b[:frames]
-                        else:
-                            b = np.zeros((frames, ch_out), dtype=np.float32)
-                        outdata[:] = b
-
-                    # Abrimos ambos con contexto; si sale bien, devolvemos los context managers
-                    in_stream = sd.InputStream(device=self._in_idx, samplerate=sr, dtype="float32",
-                                               channels=ch_in, blocksize=self.block,
-                                               callback=in_cb, extra_settings=was_in)
-                    out_stream = sd.OutputStream(device=self._out_idx, samplerate=sr, dtype="float32",
-                                                 channels=ch_out, blocksize=self.block,
-                                                 callback=out_cb, extra_settings=was_out)
-                    in_stream.__enter__()
-                    out_stream.__enter__()
-                    self.log.emit(f"OK con SR={sr}  in_excl={mode['in_excl']} out_excl={mode['out_excl']} ch_in={ch_in} ch_out={ch_out}")
-                    return in_stream, out_stream
-                except Exception as e:
-                    last_error = repr(e)
-                    self.log.emit(f"[INTENTO FALLÓ] SR={sr} in_excl={mode['in_excl']} out_excl={mode['out_excl']} → {last_error}")
-                    # Cierra si quedó medio abierto (por seguridad)
+                # extra_settings solo si tuviera WASAPI loopback (no en tu caso)
+                extra_in  = None
+                extra_out = None
+                if self._use_wasapi_loopback:
                     try:
-                        in_stream.__exit__(None, None, None)  # type: ignore
+                        extra_in  = sd.WasapiSettings(exclusive=False)  # sin 'loopback', no disponible en tu build
+                        extra_out = sd.WasapiSettings(exclusive=False)
                     except Exception:
-                        pass
-                    try:
-                        out_stream.__exit__(None, None, None) # type: ignore
-                    except Exception:
-                        pass
+                        extra_in = extra_out = None
 
-        raise RuntimeError(f"No pude abrir streams tras {len(sr_candidates)*len(mode_candidates)} intentos. Último error: {last_error}")
+                in_stream = sd.InputStream(device=self._in_idx, samplerate=sr, dtype="float32",
+                                           channels=ch_in, blocksize=self.block,
+                                           callback=in_cb, extra_settings=extra_in)
+                out_stream = sd.OutputStream(device=self._out_idx, samplerate=sr, dtype="float32",
+                                             channels=ch_out, blocksize=self.block,
+                                             callback=out_cb, extra_settings=extra_out)
+                in_stream.__enter__(); out_stream.__enter__()
+                self.log.emit(f"OK SR={sr} ch_in={ch_in} ch_out={ch_out}")
+                return in_stream, out_stream
+            except Exception as e:
+                last_error = repr(e)
+                self.log.emit(f"[INTENTO FALLÓ] SR={sr} → {last_error}")
+                try: in_stream.__exit__(None, None, None)  # type: ignore
+                except Exception: pass
+                try: out_stream.__exit__(None, None, None) # type: ignore
+                except Exception: pass
+
+        raise RuntimeError(f"No pude abrir streams. Último error: {last_error}")
 
     def run(self):
         try:
-            self._find_devices()
+            self._choose_devices()
         except Exception as e:
             dump_devices_to_log()
             self.log.emit(f"[ERROR] Dispositivos: {e}")
             return
 
         try:
-            in_stream, out_stream = self._open_streams_robusto()
+            in_stream, out_stream = self._open_streams()
         except Exception as e:
             dump_devices_to_log()
             self.log.emit(f"[ERROR] Inicio de audio: {e}")
@@ -280,7 +280,7 @@ class AudioWorker(QtCore.QThread):
     def stop(self):
         self._stop = True
 
-# ---------- Ventana ----------
+# ---------- UI ----------
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -295,8 +295,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         central = QtWidgets.QWidget(); self.setCentralWidget(central)
 
-        # Controles
-        self.out_combo     = QtWidgets.QComboBox()     # destino → CABLE Input
+        self.out_combo     = QtWidgets.QComboBox()
         self.refresh_btn   = QtWidgets.QPushButton("Actualizar dispositivos")
 
         self.block_spin    = QtWidgets.QSpinBox();  self.block_spin.setRange(120, 4096); self.block_spin.setValue(DEFAULT_BLOCK)
@@ -313,7 +312,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.footer = QtWidgets.QLabel("© 2025 Gabriel Golker"); self.footer.setAlignment(QtCore.Qt.AlignCenter)
 
-        # Layout
         form = QtWidgets.QFormLayout()
         form.addRow("Salida (→ CABLE Input):", self.out_combo)
 
@@ -338,39 +336,27 @@ class MainWindow(QtWidgets.QMainWindow):
         v.addLayout(h4); v.addSpacing(8)
         v.addLayout(h3); v.addStretch(); v.addWidget(self.footer)
 
-        # Señales
         self.refresh_btn.clicked.connect(self.populate_devices)
         self.start_btn.clicked.connect(self._on_start)
         self.stop_btn.clicked.connect(self._on_stop)
         self.open_logs_btn.clicked.connect(self.open_logs)
         self.test_tone_btn.clicked.connect(self._play_test_tone)
 
-        # Bandeja
         self._init_tray()
 
-        # Carga + autostart
         self.populate_devices()
         QtCore.QTimer.singleShot(400, self.autostart)
-
-    def _get_wasapi_index(self):
-        for idx, api in enumerate(sd.query_hostapis()):
-            if "wasapi" in api.get("name", "").lower():
-                return idx
-        return None
 
     def populate_devices(self):
         try:
             self.out_combo.clear()
             names = []
-            wasapi_index = self._get_wasapi_index()
-            if wasapi_index is None:
-                raise RuntimeError("No hay WASAPI disponible.")
             for i, dev in enumerate(sd.query_devices()):
-                if dev.get("hostapi") == wasapi_index and dev.get("max_output_channels", 0) > 0:
+                if dev.get("max_output_channels", 0) > 0:
                     names.append(f"#{i}  {dev['name']}")
             names = sorted(names, key=lambda n: 0 if "cable input" in n.lower() else 1)
             if not names:
-                raise RuntimeError("No hay salidas WASAPI.")
+                raise RuntimeError("No hay salidas de audio en el sistema.")
             self.out_combo.addItems(names)
             logger.info("Dispositivos actualizados.")
         except Exception as e:
@@ -411,22 +397,19 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _post_start_check(self):
         if self.worker and self.worker.isRunning():
-            self.is_running = True
             self.start_btn.setEnabled(False)
             self.stop_btn.setEnabled(True)
             self._tray_set_tooltip(True)
-            logger.info("Audio iniciado (WASAPI loopback).")
+            logger.info("Audio iniciado.")
         else:
-            self.is_running = False
             self._tray_set_tooltip(False)
-            QtWidgets.QMessageBox.critical(self, "Error", "No se pudo iniciar el audio. Revisa los logs (verás cada intento y el error exacto).")
+            QtWidgets.QMessageBox.critical(self, "Error", "No se pudo iniciar el audio. Revisa logs.")
 
     def _on_stop(self):
         if self.worker:
             self.worker.stop()
             self.worker.wait(2000)
             self.worker = None
-        self.is_running = False
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self._tray_set_tooltip(False)
@@ -440,15 +423,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.level_label.setText(f"Nivel: {dbfs:.1f} dBFS")
 
     def _play_test_tone(self):
-        # 440 Hz, -12 dBFS, 2 s
-        sr = int(SUGGESTED_SR)
+        # Reproduce 440 Hz al altavoz por defecto (para ver subir el medidor si la fuente es Stereo Mix)
+        sr = 44100
         dur = 2.0
         t = np.linspace(0, dur, int(sr*dur), endpoint=False, dtype=np.float32)
         amp = 10.0 ** (-12.0 / 20.0)
         tone = (amp * np.sin(2*np.pi*440.0*t)).astype(np.float32)
         if FORCE_STEREO: tone = np.stack([tone, tone], axis=1)
         try:
-            sd.play(tone, samplerate=sr, blocking=False)  # al altavoz por defecto (para ver nivel)
+            sd.play(tone, samplerate=sr, blocking=False)
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Error", f"No pude reproducir tono de prueba:\n{e}")
 
@@ -458,9 +441,6 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as e:
             logger.exception(f"No se pudieron abrir los logs: {e}")
             QtWidgets.QMessageBox.critical(self, "Error", f"No se pudieron abrir los logs:\n{e}")
-
-    def _append_log(self, msg: str):
-        logger.info(msg)
 
     # ---- Bandeja ----
     def _init_tray(self):
@@ -488,12 +468,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.showNormal(); self.activateWindow(); self.raise_()
 
     def _tray_toggle(self):
-        if self.is_running: self._on_stop()
+        if self.stop_btn.isEnabled(): self._on_stop()
         else: self._on_start()
 
     def _tray_quit(self):
         try:
-            if self.is_running: self._on_stop()
+            if self.stop_btn.isEnabled(): self._on_stop()
         finally:
             QtWidgets.QApplication.quit()
 
@@ -501,7 +481,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if reason == QtWidgets.QSystemTrayIcon.Trigger:
             self._tray_show_window()
 
-    # Cerrar → minimizar a bandeja
     def closeEvent(self, event: QtGui.QCloseEvent):
         if self.tray and self.tray.isVisible():
             event.ignore()
@@ -523,5 +502,4 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
 
