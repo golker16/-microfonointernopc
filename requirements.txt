@@ -1,4 +1,5 @@
 PySide6>=6.7
 qdarkstyle>=3.2
-soundcard>=0.4.3
-numpy>=1.26
+soundcard==0.4.3
+numpy==1.26.4
+
