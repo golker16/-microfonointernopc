@@ -71,10 +71,9 @@ def dump_devices_to_log():
         logger.exception(f"No pude listar dispositivos: {e}")
 
 def has_wasapi_loopback_support() -> bool:
-    # En tu 0.5.2 lanza TypeError por 'loopback'
+    # En sounddevice 0.5.2 no existe el kw 'loopback' → devolvemos False
     try:
-        _ = sd.WasapiSettings(exclusive=False)  # existe la clase
-        # pero NO intentemos pasar loopback aquí, porque en tu versión no existe
+        _ = sd.WasapiSettings(exclusive=False)
         return False
     except Exception:
         return False
@@ -125,13 +124,11 @@ class AudioWorker(QtCore.QThread):
         return None, None
 
     def _find_default_output_index_any(self):
-        # Por si hiciera falta (no usamos loopback en tu versión, pero lo dejo)
         try:
             if sd.default.device and sd.default.device[1] is not None:
                 return sd.default.device[1], sd.query_devices(sd.default.device[1])
         except Exception:
             pass
-        # fallback: primera salida que encontremos
         for i, dev in enumerate(sd.query_devices()):
             if dev.get("max_output_channels", 0) > 0:
                 return i, dev
@@ -146,14 +143,12 @@ class AudioWorker(QtCore.QThread):
 
         # Entrada:
         if self._use_wasapi_loopback:
-            # (no se usará en tu 0.5.2, pero dejamos el camino)
             idx, dev = self._find_default_output_index_any()
             if idx is None:
                 raise RuntimeError("No encontré salida por defecto para usar como loopback.")
             self._in_idx, self._in_dev = idx, dev
             self.log.emit(f"Loopback (WASAPI) de salida idx #{idx}: {dev['name']}")
         else:
-            # Usar fuente física tipo "Mezcla estéreo"
             idx, dev = self._find_stereo_mix_index()
             if idx is None:
                 raise RuntimeError("No encontré 'Stereo Mix / Mezcla estéreo'. Actívalo en Panel de control → Sonido → Grabación.")
@@ -161,7 +156,7 @@ class AudioWorker(QtCore.QThread):
             self.log.emit(f"Fuente: {dev['name']}  →  Salida: {out_dev['name']}")
 
     def _open_streams(self):
-        # Negociar SR: sugerido → default de in/out → 44100 → 48000
+        # Negociar SR: sugerido → defaults → 44100 → 48000
         sr_candidates = []
         seen = set()
         for sr in [SUGGESTED_SR,
@@ -172,7 +167,6 @@ class AudioWorker(QtCore.QThread):
                 seen.add(sr); sr_candidates.append(sr)
 
         ch_out = 2 if FORCE_STEREO else min(self._out_dev.get("max_output_channels",2), 2)
-        # Si usamos Stereo Mix como **input**, sus canales son "max_input_channels"
         ch_in  = min(self._in_dev.get("max_input_channels", 2), 2) if not self._use_wasapi_loopback \
                  else min(self._in_dev.get("max_output_channels", 2), 2)
 
@@ -224,16 +218,7 @@ class AudioWorker(QtCore.QThread):
                         b = np.zeros((frames, ch_out), dtype=np.float32)
                     outdata[:] = b
 
-                # extra_settings solo si tuviera WASAPI loopback (no en tu caso)
-                extra_in  = None
-                extra_out = None
-                if self._use_wasapi_loopback:
-                    try:
-                        extra_in  = sd.WasapiSettings(exclusive=False)  # sin 'loopback', no disponible en tu build
-                        extra_out = sd.WasapiSettings(exclusive=False)
-                    except Exception:
-                        extra_in = extra_out = None
-
+                extra_in = None; extra_out = None  # en tu build no usamos WasapiSettings con loopback
                 in_stream = sd.InputStream(device=self._in_idx, samplerate=sr, dtype="float32",
                                            channels=ch_in, blocksize=self.block,
                                            callback=in_cb, extra_settings=extra_in)
@@ -291,7 +276,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.worker: AudioWorker | None = None
         self.tray = None
-        self.is_running = False
 
         central = QtWidgets.QWidget(); self.setCentralWidget(central)
 
@@ -387,7 +371,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 mono=self.mono_chk.isChecked(),
                 sys_gain=self.sys_gain.value(),
             )
-            self.worker.log.connect(self._append_log)
+            self.worker.log.connect(self._append_log)   # <-- ahora existe
             self.worker.level.connect(self._update_level)
             self.worker.start()
             QtCore.QTimer.singleShot(400, self._post_start_check)
@@ -422,8 +406,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.level_bar.setValue(val)
         self.level_label.setText(f"Nivel: {dbfs:.1f} dBFS")
 
+    def _append_log(self, msg: str):
+        # <-- FALTABA: ahora los mensajes del worker van al log
+        logger.info(msg)
+
     def _play_test_tone(self):
-        # Reproduce 440 Hz al altavoz por defecto (para ver subir el medidor si la fuente es Stereo Mix)
+        # Reproduce 440 Hz al altavoz por defecto (para verificar que “Mezcla estéreo” lo ve)
         sr = 44100
         dur = 2.0
         t = np.linspace(0, dur, int(sr*dur), endpoint=False, dtype=np.float32)
@@ -502,3 +490,4 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
