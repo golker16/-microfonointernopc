@@ -7,71 +7,79 @@ import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-# --- Parche de compatibilidad NumPy 2.x --------------------------------------
-# soundcard usa np.fromstring en modo binario (eliminado en NumPy 2).
-# Este wrapper redirige binario -> frombuffer y deja el resto igual.
+# --- Parche compat NumPy 2.x (soundcard usa fromstring binario) ----------------
 import numpy as np
-
 _original_fromstring = np.fromstring
-
 def _compat_fromstring(s, dtype=float, count=-1, sep=''):
-    # Modo binario clásico: objeto bytes/bytearray/memoryview y sep == ''
     if isinstance(s, (bytes, bytearray, memoryview)) and (sep == '' or sep is None):
         return np.frombuffer(s, dtype=dtype, count=count if count != -1 else -1)
-    # Para texto/otros casos, usa el comportamiento normal
     return _original_fromstring(s, dtype=dtype, count=count, sep=sep)
-
-# Forzar el wrapper (seguro también en NumPy 1.x)
 np.fromstring = _compat_fromstring
-# -----------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 
-import soundcard as sc  # después del parche
+# Audio backends
+try:
+    import soundcard as sc
+except Exception:
+    sc = None
+
+try:
+    import sounddevice as sd
+    import soundfile as sf
+except Exception:
+    sd = None
+    sf = None
 
 from PySide6 import QtCore, QtGui, QtWidgets
 import qdarkstyle
 
 APP_NAME = "VirtualMicRelay"
-DEFAULT_SR = 48000
-DEFAULT_BLOCK = 960  # ~20 ms @ 48 kHz (estable)
-WARMUP_BLOCKS = 6    # descartar buffers iniciales (drivers pueden soltar basura)
-FADE_MS = 120        # fade in suave para evitar "pop/ruido" al iniciar
+# === Defaults alineados con tu otro proyecto ===
+DEFAULT_SR = 32000         # 32 kHz como CallCenter Helper
+DEFAULT_BLOCK = 640        # ~20 ms a 32 kHz
+WARMUP_BLOCKS = 6
+FADE_MS = 120
 
-LOG_DIR = Path("logs")
-LOG_DIR.mkdir(exist_ok=True)
+LOG_DIR = Path("logs"); LOG_DIR.mkdir(exist_ok=True)
 LOG_FILE = LOG_DIR / "app.log"
 
 # ---------- Logging ----------
 logger = logging.getLogger(APP_NAME)
 logger.setLevel(logging.DEBUG)
-fmt = logging.Formatter(
-    "%(asctime)s | %(levelname)-8s | %(threadName)s | %(name)s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+fmt = logging.Formatter("%(asctime)s | %(levelname)-8s | %(threadName)s | %(name)s | %(message)s",
+                        datefmt="%Y-%m-%d %H:%M:%S")
 fh = RotatingFileHandler(LOG_FILE, maxBytes=2_000_000, backupCount=3, encoding="utf-8")
 fh.setFormatter(fmt); fh.setLevel(logging.DEBUG); logger.addHandler(fh)
 ch = logging.StreamHandler(sys.stdout)
 ch.setFormatter(fmt); ch.setLevel(logging.INFO); logger.addHandler(ch)
 
-# Log de versiones para confirmar entorno
-logger.info(f"NumPy={np.__version__}  soundcard={getattr(sc, '__version__', 'unknown')}")
+logger.info(f"NumPy={np.__version__}  soundcard={getattr(sc, '__version__', 'N/A')}  sounddevice={'OK' if sd else 'N/A'}")
 
-# ---------- Util ----------
+# ---------- Utils ----------
 def sanitize(x: np.ndarray) -> np.ndarray:
-    """Reemplaza NaN/Inf y recorta para evitar ruido por desbordes."""
     x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
     return np.clip(x, -1.0, 1.0)
 
 def make_fade_in(num_frames: int, channels: int) -> np.ndarray:
-    if num_frames <= 0:
-        return None
+    if num_frames <= 0: return None
     fade = np.linspace(0.0, 1.0, num_frames, endpoint=True, dtype=np.float32)
     return fade[:, None].repeat(channels, axis=1)
 
+def to_mono(arr: np.ndarray) -> np.ndarray:
+    if arr.ndim == 1 or arr.shape[1] == 1: return arr
+    return arr.mean(axis=1, keepdims=True)
+
 # ---------- Audio Worker ----------
 class AudioWorker(threading.Thread):
-    def __init__(self, *, out_name, mix_mic_name, sr, block, mono, sys_gain, mic_gain, limiter, monitor_local=False):
+    """
+    Captura loopback de un altavoz (igual que CallCenter Helper) y
+    lo envía en tiempo real al altavoz virtual 'CABLE Input'.
+    Si soundcard falla, intenta fallback con sounddevice (captura del mic por defecto).
+    """
+    def __init__(self, *, loopback_name, out_name, mix_mic_name, sr, block, mono, sys_gain, mic_gain, limiter, monitor_local=False):
         super().__init__(daemon=True, name="AudioWorker")
         self.stop_event = threading.Event()
+        self.loopback_name = loopback_name
         self.out_name = out_name
         self.mix_mic_name = mix_mic_name
         self.sr = int(sr)
@@ -82,15 +90,13 @@ class AudioWorker(threading.Thread):
         self.limiter = bool(limiter)
         self.monitor_local = bool(monitor_local)
 
-    def _downmix_to_mono(self, x: np.ndarray) -> np.ndarray:
-        if x.ndim == 1 or x.shape[1] == 1:
-            return x
-        return np.mean(x, axis=1, keepdims=True)
+        # Estado fallback
+        self._use_fallback = False
 
-    def _apply_limiter(self, x: np.ndarray, ceiling: float = 0.98) -> np.ndarray:
-        return np.clip(x, -ceiling, ceiling)
-
+    # ---- Helpers soundcard ----
     def _find_speaker(self, name_substring):
+        if sc is None:
+            raise RuntimeError("soundcard no está disponible.")
         spks = sc.all_speakers()
         logger.debug(f"Speakers: {[s.name for s in spks]}")
         for s in spks:
@@ -98,16 +104,20 @@ class AudioWorker(threading.Thread):
                 return s
         raise RuntimeError(f"No se encontró salida con nombre que contenga: '{name_substring}'")
 
-    def _get_system_loopback_mic(self):
-        spk = sc.default_speaker()
-        mic = sc.get_microphone(id=spk.name, include_loopback=True)
+    def _get_loopback_mic(self):
+        if sc is None:
+            raise RuntimeError("soundcard no disponible para loopback.")
+        if self.loopback_name and self.loopback_name.strip() and self.loopback_name != "(por defecto)":
+            spk = self._find_speaker(self.loopback_name)
+        else:
+            spk = sc.default_speaker()
+        mic = sc.get_microphone(spk.name, include_loopback=True)
         if mic is None:
-            raise RuntimeError("No pude obtener loopback del sistema (WASAPI).")
-        return mic
+            raise RuntimeError(f"No pude obtener loopback de: {spk.name}")
+        return mic, spk.name
 
     def _get_physical_mic(self, name_substring):
-        if not name_substring:
-            return None
+        if not name_substring or sc is None: return None
         mics = sc.all_microphones(include_loopback=True)
         logger.debug(f"Microphones: {[m.name for m in mics]}")
         for m in mics:
@@ -115,18 +125,74 @@ class AudioWorker(threading.Thread):
                 return m
         raise RuntimeError(f"No se encontró micrófono que contenga: '{name_substring}'")
 
+    def _apply_limiter(self, x: np.ndarray, ceiling: float = 0.98) -> np.ndarray:
+        return np.clip(x, -ceiling, ceiling)
+
+    # ---- Fallback con sounddevice (si no hay loopback posible) ----
+    def _fallback_stream(self):
+        """Captura desde el dispositivo de entrada por defecto (mic) con sounddevice."""
+        if sd is None:
+            raise RuntimeError("Fallback requerido pero sounddevice no está disponible.")
+        logger.warning("Usando fallback con sounddevice (mic por defecto). No es loopback del sistema.")
+        # Prepara salida con soundcard (CABLE Input) si es posible; si no, hacemos salida con sounddevice
+        out_by_sd = False
+        try:
+            out_spk = self._find_speaker(self.out_name)
+            # abrimos un player con soundcard
+            player_ctx = out_spk.player(samplerate=self.sr, blocksize=self.block)
+            player_ctx.__enter__()
+            player = player_ctx
+        except Exception as e:
+            logger.error(f"No pude abrir salida con soundcard: {e}. Intentaré salida con sounddevice.")
+            out_by_sd = True
+            player_ctx = None
+            player = None
+
+        # stream de entrada SD
+        def callback(indata, frames, time_info, status):
+            if self.stop_event.is_set():
+                raise sd.CallbackStop()
+            x = np.asarray(indata, dtype=np.float32)
+            if self.mono:
+                x = to_mono(x)
+            x *= self.sys_gain
+            if self.limiter:
+                x = self._apply_limiter(x)
+            if player is not None:
+                player.play(x)
+            else:
+                # salida sounddevice (si falló soundcard)
+                sd.play(x, samplerate=self.sr, blocking=False)
+
+        with sd.InputStream(samplerate=self.sr, channels=1 if self.mono else 2, dtype="float32", blocksize=self.block, callback=callback):
+            while not self.stop_event.is_set():
+                time.sleep(0.05)
+        if player_ctx:
+            player_ctx.__exit__(None, None, None)
+
+    # ---- Loop principal ----
     def run(self):
         try:
             logger.info("Inicializando captura y reproducción…")
-            sys_mic = self._get_system_loopback_mic()
-            out_spk = self._find_speaker(self.out_name)
-            phys_mic = self._get_physical_mic(self.mix_mic_name)
 
-            logger.info(f"Loopback sistema: {sys_mic.name}")
-            logger.info(f"Salida destino  : {out_spk.name}")
-            logger.info(f"Mic físico mix  : {phys_mic.name if phys_mic else '(ninguno)'}")
-            logger.info(f"SR={self.sr} block={self.block} mono={self.mono} "
-                        f"sys_gain={self.sys_gain} mic_gain={self.mic_gain} limiter={self.limiter}")
+            # Intenta abrir loopback + salida con soundcard
+            try:
+                sys_mic, src_spk_name = self._get_loopback_mic()
+                out_spk = self._find_speaker(self.out_name)
+                phys_mic = self._get_physical_mic(self.mix_mic_name)
+                logger.info(f"Loopback de: {src_spk_name}")
+                logger.info(f"Salida destino  : {out_spk.name}")
+                logger.info(f"Mic físico mix  : {phys_mic.name if phys_mic else '(ninguno)'}")
+                logger.info(f"SR={self.sr} block={self.block} mono={self.mono} "
+                            f"sys_gain={self.sys_gain} mic_gain={self.mic_gain} limiter={self.limiter}")
+            except Exception as e:
+                logger.error(f"No se pudo preparar loopback con soundcard: {e}")
+                self._use_fallback = True
+
+            if self._use_fallback:
+                self._fallback_stream()
+                logger.info("Audio detenido (fallback).")
+                return
 
             mon_spk = sc.default_speaker() if self.monitor_local else None
 
@@ -135,29 +201,27 @@ class AudioWorker(threading.Thread):
                  out_spk.player(samplerate=self.sr, blocksize=self.block) as player, \
                  (mon_spk.player(samplerate=self.sr, blocksize=self.block) if mon_spk else _NullCtx()) as mon_player:
 
-                # Warm-up: descarta buffers iniciales
+                # Warm-up
                 for _ in range(WARMUP_BLOCKS):
                     _ = sys_rec.record(self.block)
 
-                # Fade-in al inicio
                 fade_frames = int(self.sr * (FADE_MS / 1000.0))
                 fade_left = fade_frames
 
                 while not self.stop_event.is_set():
-                    sys_frames = sys_rec.record(self.block)  # float32 (N, ch)
+                    sys_frames = sys_rec.record(self.block)  # (N, ch) float32
                     sys_frames = sanitize(sys_frames)
-
                     if self.mono:
-                        sys_frames = self._downmix_to_mono(sys_frames)
+                        sys_frames = to_mono(sys_frames)
+                    sys_frames *= self.sys_gain
 
-                    sys_frames = sys_frames * self.sys_gain
-
-                    if phys_mic:
+                    # mezcla mic físico si aplica
+                    if mic_rec:
                         mic_frames = mic_rec.record(self.block)
                         mic_frames = sanitize(mic_frames)
                         if self.mono:
-                            mic_frames = self._downmix_to_mono(mic_frames)
-                        # igualar canales
+                            mic_frames = to_mono(mic_frames)
+                        # emparejar canales
                         if sys_frames.shape[1] != mic_frames.shape[1]:
                             if sys_frames.shape[1] == 1 and mic_frames.shape[1] == 2:
                                 sys_frames = np.repeat(sys_frames, 2, axis=1)
@@ -167,15 +231,15 @@ class AudioWorker(threading.Thread):
                     else:
                         mix = sys_frames
 
-                    # Fade-in solo al comienzo
+                    # Fade-in inicial
                     if fade_left > 0:
                         n = min(fade_left, mix.shape[0])
                         fade = make_fade_in(n, mix.shape[1])
                         mix[:n, :] *= fade
                         fade_left -= n
 
-                    if self.limiter:
-                        mix = self._apply_limiter(mix)
+                    # limiter suave
+                    mix = np.clip(mix, -0.98, 0.98) if self.limiter else mix
 
                     player.play(mix)
                     if mon_player:
@@ -189,25 +253,20 @@ class AudioWorker(threading.Thread):
         self.stop_event.set()
 
 class _NullCtx:
-    """Contexto nulo: devuelve None, para que el 'if mon_player:' sea False y no se llame .play()."""
-    def __enter__(self): 
-        return None
-    def __exit__(self, exc_type, exc, tb): 
-        return False
+    def __enter__(self): return None
+    def __exit__(self, exc_type, exc, tb): return False
 
 # ---------- GUI ----------
 class MainWindow(QtWidgets.QMainWindow):
     startRequested = QtCore.Signal(dict)
-    stopRequested = QtCore.Signal()
+    stopRequested  = QtCore.Signal()
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_NAME)
-        self.setMinimumSize(820, 520)
-        self.setWindowIcon(
-            QtGui.QIcon("assets/app.ico") if Path("assets/app.ico").exists()
-            else self.style().standardIcon(QtWidgets.QStyle.SP_MediaPlay)
-        )
+        self.setMinimumSize(900, 580)
+        self.setWindowIcon(QtGui.QIcon("assets/app.ico") if Path("assets/app.ico").exists()
+                           else self.style().standardIcon(QtWidgets.QStyle.SP_MediaPlay))
 
         self.worker: AudioWorker | None = None
         self.tray = None
@@ -216,26 +275,28 @@ class MainWindow(QtWidgets.QMainWindow):
         central = QtWidgets.QWidget(); self.setCentralWidget(central)
 
         # Controles
-        self.out_combo = QtWidgets.QComboBox()
-        self.mic_combo = QtWidgets.QComboBox()
-        self.refresh_btn = QtWidgets.QPushButton("Actualizar dispositivos")
+        self.loopback_combo = QtWidgets.QComboBox()   # altavoz de donde capturamos (loopback)
+        self.out_combo      = QtWidgets.QComboBox()   # destino → CABLE Input
+        self.mic_combo      = QtWidgets.QComboBox()   # mic físico (opcional)
+        self.refresh_btn    = QtWidgets.QPushButton("Actualizar dispositivos")
 
-        self.sr_spin = QtWidgets.QSpinBox(); self.sr_spin.setRange(8000, 192000); self.sr_spin.setValue(DEFAULT_SR)
+        self.sr_spin    = QtWidgets.QSpinBox(); self.sr_spin.setRange(8000, 192000); self.sr_spin.setValue(DEFAULT_SR)
         self.block_spin = QtWidgets.QSpinBox(); self.block_spin.setRange(120, 4096); self.block_spin.setValue(DEFAULT_BLOCK)
-        self.mono_chk = QtWidgets.QCheckBox("Forzar mono"); self.mono_chk.setChecked(False)
-        self.limiter_chk = QtWidgets.QCheckBox("Limitador"); self.limiter_chk.setChecked(True)
+        self.mono_chk   = QtWidgets.QCheckBox("Forzar mono"); self.mono_chk.setChecked(True)   # como tu proyecto
+        self.limiter_chk= QtWidgets.QCheckBox("Limitador"); self.limiter_chk.setChecked(True)
 
         self.sys_gain_d = QtWidgets.QDoubleSpinBox(); self.sys_gain_d.setRange(0.0, 5.0); self.sys_gain_d.setSingleStep(0.1); self.sys_gain_d.setValue(1.0)
         self.mic_gain_d = QtWidgets.QDoubleSpinBox(); self.mic_gain_d.setRange(0.0, 5.0); self.mic_gain_d.setSingleStep(0.1); self.mic_gain_d.setValue(1.0)
 
-        self.start_btn = QtWidgets.QPushButton("Iniciar")
-        self.stop_btn = QtWidgets.QPushButton("Detener"); self.stop_btn.setEnabled(False)
+        self.start_btn   = QtWidgets.QPushButton("Iniciar")
+        self.stop_btn    = QtWidgets.QPushButton("Detener"); self.stop_btn.setEnabled(False)
         self.open_logs_btn = QtWidgets.QPushButton("Abrir logs")
 
         self.footer = QtWidgets.QLabel("© 2025 Gabriel Golker"); self.footer.setAlignment(QtCore.Qt.AlignCenter)
 
         # Layout
         form = QtWidgets.QFormLayout()
+        form.addRow("Fuente de loopback (capturar de):", self.loopback_combo)
         form.addRow("Salida (→ CABLE Input):", self.out_combo)
         form.addRow("Mic físico (opcional):", self.mic_combo)
 
@@ -268,21 +329,30 @@ class MainWindow(QtWidgets.QMainWindow):
         # Bandeja
         self._init_tray()
 
-        # Carga y AUTOSTART
+        # Carga inicial + autostart
         self.populate_devices()
-        QtCore.QTimer.singleShot(400, self.autostart)  # arranca solo al abrir
+        QtCore.QTimer.singleShot(500, self.autostart)
 
     def populate_devices(self):
         try:
+            # Loopback fuente
+            self.loopback_combo.clear()
+            loop_items = ["(por defecto)"]
+            if sc:
+                loop_items += [s.name for s in sc.all_speakers()]
+            self.loopback_combo.addItems(loop_items)
+
+            # Salidas (destino → CABLE Input)
             self.out_combo.clear()
-            outs = [s.name for s in sc.all_speakers()]
-            # Prioriza VB-CABLE Input si existe
+            outs = [s.name for s in sc.all_speakers()] if sc else []
             outs_sorted = sorted(outs, key=lambda n: 0 if "cable input" in n.lower() else 1)
             self.out_combo.addItems(outs_sorted)
 
+            # Mics físicos
             self.mic_combo.clear(); self.mic_combo.addItem("(ninguno)")
-            mics = [m.name for m in sc.all_microphones(include_loopback=True)]
-            self.mic_combo.addItems(mics)
+            if sc:
+                mics = [m.name for m in sc.all_microphones(include_loopback=True)]
+                self.mic_combo.addItems(mics)
 
             logger.info("Dispositivos actualizados.")
         except Exception as e:
@@ -290,25 +360,25 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(self, "Error", f"Error al listar dispositivos:\n{e}")
 
     def autostart(self):
-        # valida que el destino sea CABLE Input
-        chosen = self.out_combo.currentText()
-        if "cable input" not in chosen.lower():
+        chosen_out = self.out_combo.currentText()
+        if "cable input" not in (chosen_out or "").lower():
             QtWidgets.QMessageBox.critical(self, "VB-CABLE no detectado",
-                "No encontré 'CABLE Input (VB-Audio Virtual Cable)'.\n"
+                "No encontré 'CABLE Input (VB-Audio Virtual Cable)' como salida.\n"
                 "Instálalo y reinicia Windows, o selecciónalo en 'Salida' manualmente.")
         self._on_start()
 
     def _on_start(self):
         cfg = {
+            "loopback_name": None if self.loopback_combo.currentIndex() == 0 else self.loopback_combo.currentText(),
             "out_name": self.out_combo.currentText(),
             "mix_mic_name": None if self.mic_combo.currentIndex() == 0 else self.mic_combo.currentText(),
             "sr": self.sr_spin.value(),
             "block": self.block_spin.value(),
-            "mono": self.mono_chk.isChecked(),
+            "mono": self.mono_chk.isChecked(),        # por defecto True (como tu proyecto)
             "sys_gain": self.sys_gain_d.value(),
             "mic_gain": self.mic_gain_d.value(),
             "limiter": self.limiter_chk.isChecked(),
-            "monitor_local": False,  # evita feedback por defecto
+            "monitor_local": False,                    # evita feedback
         }
         logger.info("Start solicitado por la app (auto/usuario).")
         self.startRequested.emit(cfg)
@@ -324,13 +394,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
             self.worker = AudioWorker(**cfg)
             self.worker.start()
-            time.sleep(0.2)
+            time.sleep(0.25)
             self.is_running = self.worker.is_alive()
             if not self.is_running:
                 logger.error("El worker no quedó en ejecución. Revisa logs.")
                 QtWidgets.QMessageBox.critical(self, "Error", "No se pudo iniciar el audio. Revisa los logs.")
-                self.worker = None
-                return
+                self.worker = None; return
             self.start_btn.setEnabled(False); self.stop_btn.setEnabled(True)
             self._tray_set_tooltip(running=True)
             logger.info("Audio iniciado.")
@@ -384,15 +453,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.showNormal(); self.activateWindow(); self.raise_()
 
     def _tray_toggle(self):
-        if self.is_running:
-            self._on_stop()
-        else:
-            self._on_start()
+        if self.is_running: self._on_stop()
+        else: self._on_start()
 
     def _tray_quit(self):
         try:
-            if self.is_running:
-                self.stop_worker()
+            if self.is_running: self.stop_worker()
         finally:
             QtWidgets.QApplication.quit()
 
@@ -413,8 +479,7 @@ def main():
     try:
         app = QtWidgets.QApplication(sys.argv)
         app.setStyleSheet(qdarkstyle.load_stylesheet(qt_api='pyside6'))
-        mw = MainWindow()
-        mw.show()
+        mw = MainWindow(); mw.show()
         sys.exit(app.exec())
     except Exception as e:
         logger.exception(f"Fallo crítico al iniciar la app: {e}")
@@ -422,5 +487,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
