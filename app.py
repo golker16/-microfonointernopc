@@ -1,5 +1,5 @@
 # app.py
-import sys, time, logging
+import sys, time, logging, math
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from collections import deque
@@ -49,9 +49,32 @@ def match_channels(x: np.ndarray, ch: int) -> np.ndarray:
     if x.shape[1] == 2 and ch == 1: return to_mono(x)
     return x[:, :ch]
 
+def rms_dbfs(x: np.ndarray, eps: float = 1e-12) -> float:
+    """Devuelve RMS en dBFS (0 dBFS = 1.0)."""
+    if x.size == 0: return -120.0
+    r = float(np.sqrt(np.mean(np.square(x), dtype=np.float64)))
+    return 20.0 * math.log10(max(r, eps))
+
+def dump_devices_to_log():
+    try:
+        hostapis = sd.query_hostapis()
+        logger.info(f"HostAPIs: {[h.get('name') for h in hostapis]}")
+        for idx, api in enumerate(hostapis):
+            logger.info(f"  [{idx}] {api.get('name')}")
+        devs = sd.query_devices()
+        logger.info(f"Dispositivos ({len(devs)})")
+        for i, d in enumerate(devs):
+            logger.info(
+                f"  #{i} name='{d.get('name')}' hostapi={d.get('hostapi')} "
+                f"in={d.get('max_input_channels')} out={d.get('max_output_channels')}"
+            )
+    except Exception as e:
+        logger.exception(f"No pude listar dispositivos: {e}")
+
 # ---------- Audio Worker (WASAPI loopback → CABLE Input) ----------
 class AudioWorker(QtCore.QThread):
-    log = QtCore.Signal(str)
+    log   = QtCore.Signal(str)
+    level = QtCore.Signal(float)   # dBFS
 
     def __init__(self, out_device_name: str, sr: int, block: int, mono: bool, sys_gain: float):
         super().__init__()
@@ -62,7 +85,7 @@ class AudioWorker(QtCore.QThread):
         self.sys_gain = float(sys_gain)
         self._stop = False
 
-        self._in_dev = None    # dict del dispositivo de salida real que usaremos como loopback (input)
+        self._in_dev = None    # dict del dispositivo de salida real (usado como loopback input)
         self._out_dev = None   # dict del dispositivo de salida destino (CABLE Input)
         self._fade_left = int(self.sr * (FADE_MS / 1000.0))
 
@@ -81,7 +104,7 @@ class AudioWorker(QtCore.QThread):
 
         devices = sd.query_devices()
 
-        # ---- Elegir salida destino (CABLE Input) por nombre (WASAPI + output) ----
+        # ---- Salida destino (CABLE Input) por nombre (WASAPI + output) ----
         sel_out = None
         for dev in devices:
             if dev.get("hostapi") == wasapi_index and dev.get("max_output_channels", 0) > 0:
@@ -91,9 +114,7 @@ class AudioWorker(QtCore.QThread):
             raise RuntimeError(f"No encontré salida WASAPI que contenga: {self.out_device_name}")
         self._out_dev = sel_out
 
-        # ---- Elegir FUENTE para loopback: altavoz por defecto del sistema ----
-        # Truco importante: en WASAPI puedes abrir un OutputStream como InputStream con loopback=True.
-        # Así que tomamos el dispositivo de SALIDA por defecto (o el primero de WASAPI) y lo usaremos como "input".
+        # ---- Fuente loopback: altavoz por defecto del sistema (abriremos como input con loopback=True) ----
         default_out_idx = None
         try:
             if sd.default.device and sd.default.device[1] is not None:
@@ -111,7 +132,7 @@ class AudioWorker(QtCore.QThread):
                 sel_in = None
 
         if sel_in is None:
-            # toma el primer dispositivo WASAPI que tenga salida
+            # toma el primero WASAPI que tenga salida (como plan B)
             for dev in devices:
                 if dev.get("hostapi") == wasapi_index and dev.get("max_output_channels", 0) > 0:
                     sel_in = dev; break
@@ -138,6 +159,7 @@ class AudioWorker(QtCore.QThread):
         try:
             self._find_devices()
         except Exception as e:
+            dump_devices_to_log()
             self.log.emit(f"[ERROR] Dispositivos: {e}")
             return
 
@@ -145,11 +167,10 @@ class AudioWorker(QtCore.QThread):
         wasapi_in  = sd.WasapiSettings(loopback=True,  exclusive=False)
         wasapi_out = sd.WasapiSettings(exclusive=False)
 
-        in_name  = self._in_dev["name"]   # ¡es un dispositivo de SALIDA, pero lo abrimos como input con loopback!
+        in_name  = self._in_dev["name"]   # es un dispositivo de SALIDA, abierto como input con loopback
         out_name = self._out_dev["name"]
 
         channels_out = 2 if FORCE_STEREO else (1 if self.mono else min(self._out_dev["max_output_channels"], 2))
-        # Para la fuente (que es salida), “max_output_channels” define cuántos canales puede capturar por loopback
         channels_in  = min(self._in_dev.get("max_output_channels", 2), 2)
 
         self.log.emit(f"SR={self.sr} block={self.block} in_ch={channels_in} out_ch={channels_out} mono={self.mono}")
@@ -175,6 +196,12 @@ class AudioWorker(QtCore.QThread):
             if LIMITER:
                 x = np.clip(x, -0.98, 0.98)
             x = self._fade_apply(x)
+            # Nivel:
+            try:
+                db = rms_dbfs(x)
+                self.level.emit(db)
+            except Exception:
+                pass
             self._q.append(x.copy())
 
         def out_cb(outdata, frames, time_info, status):
@@ -194,8 +221,6 @@ class AudioWorker(QtCore.QThread):
             outdata[:] = x
 
         try:
-            # OJO: abrimos InputStream con "device=in_name" (que es un dispositivo de salida)
-            # y loopback=True. Así capturamos TODO lo que suena por el altavoz por defecto.
             with sd.InputStream(device=in_name, samplerate=self.sr, dtype="float32",
                                 channels=channels_in, blocksize=self.block,
                                 callback=in_cb, extra_settings=wasapi_in):
@@ -207,6 +232,7 @@ class AudioWorker(QtCore.QThread):
                     while not self._stop:
                         time.sleep(0.05)
         except Exception as e:
+            dump_devices_to_log()
             self.log.emit(f"[ERROR] Audio: {e}")
 
     def stop(self):
@@ -217,7 +243,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_NAME)
-        self.setMinimumSize(860, 540)
+        self.setMinimumSize(900, 560)
         self.setWindowIcon(QtGui.QIcon("assets/app.ico") if Path("assets/app.ico").exists()
                            else self.style().standardIcon(QtWidgets.QStyle.SP_MediaPlay))
 
@@ -228,17 +254,22 @@ class MainWindow(QtWidgets.QMainWindow):
         central = QtWidgets.QWidget(); self.setCentralWidget(central)
 
         # Controles
-        self.out_combo   = QtWidgets.QComboBox()     # destino → CABLE Input
-        self.refresh_btn = QtWidgets.QPushButton("Actualizar dispositivos")
+        self.out_combo     = QtWidgets.QComboBox()     # destino → CABLE Input
+        self.refresh_btn   = QtWidgets.QPushButton("Actualizar dispositivos")
 
-        self.sr_spin     = QtWidgets.QSpinBox();  self.sr_spin.setRange(8000, 192000); self.sr_spin.setValue(DEFAULT_SR)
-        self.block_spin  = QtWidgets.QSpinBox();  self.block_spin.setRange(120, 4096); self.block_spin.setValue(DEFAULT_BLOCK)
-        self.mono_chk    = QtWidgets.QCheckBox("Forzar mono"); self.mono_chk.setChecked(True)
-        self.sys_gain    = QtWidgets.QDoubleSpinBox(); self.sys_gain.setRange(0.0, 5.0); self.sys_gain.setSingleStep(0.1); self.sys_gain.setValue(1.0)
+        self.sr_spin       = QtWidgets.QSpinBox();  self.sr_spin.setRange(8000, 192000); self.sr_spin.setValue(DEFAULT_SR)
+        self.block_spin    = QtWidgets.QSpinBox();  self.block_spin.setRange(120, 4096); self.block_spin.setValue(DEFAULT_BLOCK)
+        self.mono_chk      = QtWidgets.QCheckBox("Forzar mono"); self.mono_chk.setChecked(True)
+        self.sys_gain      = QtWidgets.QDoubleSpinBox(); self.sys_gain.setRange(0.0, 5.0); self.sys_gain.setSingleStep(0.1); self.sys_gain.setValue(1.0)
 
-        self.start_btn   = QtWidgets.QPushButton("Iniciar")
-        self.stop_btn    = QtWidgets.QPushButton("Detener"); self.stop_btn.setEnabled(False)
+        self.start_btn     = QtWidgets.QPushButton("Iniciar")
+        self.stop_btn      = QtWidgets.QPushButton("Detener"); self.stop_btn.setEnabled(False)
         self.open_logs_btn = QtWidgets.QPushButton("Abrir logs")
+        self.test_tone_btn = QtWidgets.QPushButton("Tono de prueba (440 Hz)")
+        # Medidor de nivel
+        self.level_label   = QtWidgets.QLabel("Nivel: — dBFS")
+        self.level_bar     = QtWidgets.QProgressBar(); self.level_bar.setRange(0, 100); self.level_bar.setValue(0)
+        self.level_bar.setTextVisible(False)
 
         self.footer = QtWidgets.QLabel("© 2025 Gabriel Golker"); self.footer.setAlignment(QtCore.Qt.AlignCenter)
 
@@ -256,11 +287,16 @@ class MainWindow(QtWidgets.QMainWindow):
         h2.addWidget(QtWidgets.QLabel("Ganancia:")); h2.addWidget(self.sys_gain)
 
         h3 = QtWidgets.QHBoxLayout()
-        h3.addWidget(self.start_btn); h3.addWidget(self.stop_btn); h3.addStretch(); h3.addWidget(self.open_logs_btn)
+        h3.addWidget(self.start_btn); h3.addWidget(self.stop_btn); h3.addStretch()
+        h3.addWidget(self.open_logs_btn); h3.addWidget(self.test_tone_btn)
+
+        h4 = QtWidgets.QHBoxLayout()
+        h4.addWidget(self.level_label); h4.addWidget(self.level_bar)
 
         v = QtWidgets.QVBoxLayout(central)
         v.addLayout(form); v.addSpacing(8)
-        v.addLayout(h1); v.addLayout(h2); v.addSpacing(12)
+        v.addLayout(h1); v.addLayout(h2); v.addSpacing(8)
+        v.addLayout(h4); v.addSpacing(8)
         v.addLayout(h3); v.addStretch(); v.addWidget(self.footer)
 
         # Señales
@@ -268,6 +304,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.start_btn.clicked.connect(self._on_start)
         self.stop_btn.clicked.connect(self._on_stop)
         self.open_logs_btn.clicked.connect(self.open_logs)
+        self.test_tone_btn.clicked.connect(self._play_test_tone)
 
         # Bandeja
         self._init_tray()
@@ -323,6 +360,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 sys_gain=self.sys_gain.value(),
             )
             self.worker.log.connect(self._append_log)
+            self.worker.level.connect(self._update_level)
             self.worker.start()
             QtCore.QTimer.singleShot(250, self._post_start_check)
         except Exception as e:
@@ -350,7 +388,29 @@ class MainWindow(QtWidgets.QMainWindow):
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self._tray_set_tooltip(False)
+        self._update_level(-120.0)
         logger.info("Audio detenido por el usuario.")
+
+    def _update_level(self, dbfs: float):
+        # Mapear [-60, 0] dBFS a [0, 100]
+        clipped = max(min(dbfs, 0.0), -60.0)
+        val = int((clipped + 60.0) * (100.0 / 60.0))
+        self.level_bar.setValue(val)
+        self.level_label.setText(f"Nivel: {dbfs:.1f} dBFS")
+
+    def _play_test_tone(self):
+        # 440 Hz, -12 dBFS, 2 s al altavoz por defecto (así el loopback lo “oye”)
+        sr = self.sr_spin.value()
+        dur = 2.0
+        t = np.linspace(0, dur, int(sr*dur), endpoint=False, dtype=np.float32)
+        amp = 10.0 ** (-12.0 / 20.0)  # -12 dBFS
+        tone = (amp * np.sin(2*np.pi*440.0*t)).astype(np.float32)
+        if FORCE_STEREO:
+            tone = np.stack([tone, tone], axis=1)
+        try:
+            sd.play(tone, samplerate=sr, blocking=False)  # al default output
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Error", f"No pude reproducir tono de prueba:\n{e}")
 
     def open_logs(self):
         try:
@@ -412,14 +472,17 @@ class MainWindow(QtWidgets.QMainWindow):
             super().closeEvent(event)
 
 def main():
-    app = QtWidgets.QApplication(sys.argv)
-    app.setStyleSheet(qdarkstyle.load_stylesheet(qt_api='pyside6'))
-    w = MainWindow(); w.show()
-    return app.exec()
+    try:
+        app = QtWidgets.QApplication(sys.argv)
+        app.setStyleSheet(qdarkstyle.load_stylesheet(qt_api='pyside6'))
+        w = MainWindow(); w.show()
+        return app.exec()
+    except Exception as e:
+        logger.exception(f"Fallo crítico al iniciar la app: {e}")
+        raise
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
 
 
 
