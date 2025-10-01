@@ -34,8 +34,8 @@ logger.info(f"sounddevice {sd.__version__}")
 
 # ---------- Config ----------
 DEFAULT_CFG = {
-    "input_name": "",   # nombre visible de la FUENTE a usar (p.ej. "Mezcla estéreo ...")
-    "output_name": "",  # nombre visible de la SALIDA (p.ej. "CABLE Input ...")
+    "input_name": "",
+    "output_name": "",
     "block": DEFAULT_BLOCK,
     "mono": True,
     "gain": 1.0
@@ -93,11 +93,6 @@ def dump_devices_to_log():
         logger.exception(f"No pude listar dispositivos: {e}")
 
 def find_device_by_name(name_substr: str, need_input: bool | None) -> tuple[int|None, dict|None]:
-    """
-    Busca por substring (case-insensitive) en nombres. Si need_input=True -> dispositivos con entrada.
-    Si need_input=False -> dispositivos con salida. Si None -> cualquiera.
-    Retorna (index, device_dict) o (None, None).
-    """
     name_sub = (name_substr or "").strip().lower()
     if not name_sub:
         return None, None
@@ -145,10 +140,8 @@ class AudioWorker(QtCore.QThread):
         if self.out_name:
             out_idx, out_dev = find_device_by_name(self.out_name, need_input=False)
         if out_idx is None:
-            # preferimos CABLE Input
             out_idx, out_dev = find_device_by_name("cable input", need_input=False)
         if out_idx is None:
-            # lo primero que tenga salida
             for i, dev in enumerate(sd.query_devices()):
                 if dev.get("max_output_channels",0) > 0:
                     out_idx, out_dev = i, dev; break
@@ -161,10 +154,8 @@ class AudioWorker(QtCore.QThread):
         if self.in_name:
             in_idx, in_dev = find_device_by_name(self.in_name, need_input=True)
         if in_idx is None:
-            # intentar Mezcla estéreo
             in_idx, in_dev = find_best_stereo_mix()
         if in_idx is None:
-            # cualquier input
             for i, dev in enumerate(sd.query_devices()):
                 if dev.get("max_input_channels",0) > 0:
                     in_idx, in_dev = i, dev; break
@@ -175,7 +166,6 @@ class AudioWorker(QtCore.QThread):
         self.log.emit(f"Fuente: {self._in_dev['name']}  →  Salida: {self._out_dev['name']}")
 
     def _open_streams(self):
-        # SR candidatos
         sr_candidates = []
         seen = set()
         for sr in [SUGGESTED_SR,
@@ -293,8 +283,8 @@ class MainWindow(QtWidgets.QMainWindow):
         central = QtWidgets.QWidget(); self.setCentralWidget(central)
 
         # Controles
-        self.in_combo     = QtWidgets.QComboBox()      # FUENTE
-        self.out_combo    = QtWidgets.QComboBox()      # SALIDA
+        self.in_combo     = QtWidgets.QComboBox()
+        self.out_combo    = QtWidgets.QComboBox()
         self.refresh_btn  = QtWidgets.QPushButton("Actualizar dispositivos")
         self.save_btn     = QtWidgets.QPushButton("Guardar preferencias")
 
@@ -355,13 +345,12 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             self.in_combo.clear(); self.out_combo.clear()
             in_names = []; out_names = []
-            for i, dev in enumerate(sd.query_devices()):
+            for _, dev in enumerate(sd.query_devices()):
                 name = dev.get("name","")
                 if dev.get("max_input_channels",0) > 0:
                     in_names.append(name)
                 if dev.get("max_output_channels",0) > 0:
                     out_names.append(name)
-            # ordenar: priorizar Mezcla estéreo y CABLE Input
             in_names = sorted(in_names, key=lambda n: 0 if any(k in n.lower() for k in ["stereo mix","mezcla estéreo","what u hear"]) else 1)
             out_names = sorted(out_names, key=lambda n: 0 if "cable input" in n.lower() else 1)
             if not in_names: raise RuntimeError("No hay dispositivos de entrada en el sistema.")
@@ -371,31 +360,35 @@ class MainWindow(QtWidgets.QMainWindow):
             logger.info("Dispositivos actualizados.")
 
             if select_saved:
-                # intenta seleccionar el guardado
                 def _select(cb: QtWidgets.QComboBox, name: str):
                     if not name: return
                     idx = cb.findText(name, QtCore.Qt.MatchFlag.MatchContains)
                     if idx >= 0: cb.setCurrentIndex(idx)
-                _select(self.in_combo, self.cfg.get("input_name",""))
-                _select(self.out_combo, self.cfg.get("output_name",""))
+                cfg = load_cfg()
+                _select(self.in_combo, cfg.get("input_name",""))
+                _select(self.out_combo, cfg.get("output_name",""))
+                self.block_spin.setValue(int(cfg.get("block", DEFAULT_BLOCK)))
+                self.mono_chk.setChecked(bool(cfg.get("mono", True)))
+                self.sys_gain.setValue(float(cfg.get("gain", 1.0)))
         except Exception as e:
             logger.exception(f"No se pudieron listar dispositivos: {e}")
             QtWidgets.QMessageBox.critical(self, "Error", f"Error al listar dispositivos:\n{e}")
 
     def save_prefs(self):
-        self.cfg["input_name"]  = self.in_combo.currentText()
-        self.cfg["output_name"] = self.out_combo.currentText()
-        self.cfg["block"] = int(self.block_spin.value())
-        self.cfg["mono"]  = bool(self.mono_chk.isChecked())
-        self.cfg["gain"]  = float(self.sys_gain.value())
+        cfg = {
+            "input_name":  self.in_combo.currentText(),
+            "output_name": self.out_combo.currentText(),
+            "block": int(self.block_spin.value()),
+            "mono":  bool(self.mono_chk.isChecked()),
+            "gain":  float(self.sys_gain.value()),
+        }
         try:
-            save_cfg(self.cfg)
+            save_cfg(cfg)
             QtWidgets.QMessageBox.information(self, "Guardado", "Preferencias guardadas en config.json.")
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Error", f"No se pudo guardar: {e}")
 
     def autostart(self):
-        # Si hay CABLE Input y Mezcla estéreo seleccionados, intentamos arrancar
         self._on_start()
 
     def _on_start(self):
@@ -403,7 +396,6 @@ class MainWindow(QtWidgets.QMainWindow):
             if self.worker and self.worker.isRunning():
                 QtWidgets.QMessageBox.information(self, "Info", "El audio ya está en ejecución.")
                 return
-            # Guarda lo actual para la próxima
             self.save_prefs()
             self.worker = AudioWorker(
                 in_name=self.in_combo.currentText(),
@@ -450,8 +442,14 @@ class MainWindow(QtWidgets.QMainWindow):
     def _append_log(self, msg: str):
         logger.info(msg)
 
+    def open_logs(self):
+        try:
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(LOG_FILE)))
+        except Exception as e:
+            logger.exception(f"No se pudieron abrir los logs: {e}")
+            QtWidgets.QMessageBox.critical(self, "Error", f"No se pudieron abrir los logs:\n{e}")
+
     def _play_test_tone(self):
-        # 440 Hz al altavoz por defecto (para validar que tu fuente “ve” el sistema)
         sr = 44100
         dur = 2.0
         t = np.linspace(0, dur, int(sr*dur), endpoint=False, dtype=np.float32)
