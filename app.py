@@ -7,8 +7,25 @@ import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+# --- Parche de compatibilidad NumPy 2.x --------------------------------------
+# soundcard usa np.fromstring en modo binario (eliminado en NumPy 2).
+# Este wrapper redirige binario -> frombuffer y deja el resto igual.
 import numpy as np
-import soundcard as sc
+
+_original_fromstring = np.fromstring
+
+def _compat_fromstring(s, dtype=float, count=-1, sep=''):
+    # Modo binario clásico: objeto bytes/bytearray/memoryview y sep == ''
+    if isinstance(s, (bytes, bytearray, memoryview)) and (sep == '' or sep is None):
+        return np.frombuffer(s, dtype=dtype, count=count if count != -1 else -1)
+    # Para texto/otros casos, usa el comportamiento normal
+    return _original_fromstring(s, dtype=dtype, count=count, sep=sep)
+
+# Forzar el wrapper (seguro también en NumPy 1.x)
+np.fromstring = _compat_fromstring
+# -----------------------------------------------------------------------------
+
+import soundcard as sc  # después del parche
 
 from PySide6 import QtCore, QtGui, QtWidgets
 import qdarkstyle
@@ -16,7 +33,7 @@ import qdarkstyle
 APP_NAME = "VirtualMicRelay"
 DEFAULT_SR = 48000
 DEFAULT_BLOCK = 960  # ~20 ms @ 48 kHz (estable)
-WARMUP_BLOCKS = 6    # descartar buffers iniciales (WASAPI priming)
+WARMUP_BLOCKS = 6    # descartar buffers iniciales (drivers pueden soltar basura)
 FADE_MS = 120        # fade in suave para evitar "pop/ruido" al iniciar
 
 LOG_DIR = Path("logs")
@@ -35,14 +52,18 @@ fh.setFormatter(fmt); fh.setLevel(logging.DEBUG); logger.addHandler(fh)
 ch = logging.StreamHandler(sys.stdout)
 ch.setFormatter(fmt); ch.setLevel(logging.INFO); logger.addHandler(ch)
 
+# Log de versiones para confirmar entorno
+logger.info(f"NumPy={np.__version__}  soundcard={getattr(sc, '__version__', 'unknown')}")
+
 # ---------- Util ----------
 def sanitize(x: np.ndarray) -> np.ndarray:
-    # reemplaza NaN/Inf, clamp soft para evitar ruido blanco por desbordes
+    """Reemplaza NaN/Inf y recorta para evitar ruido por desbordes."""
     x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
     return np.clip(x, -1.0, 1.0)
 
 def make_fade_in(num_frames: int, channels: int) -> np.ndarray:
-    if num_frames <= 0: return None
+    if num_frames <= 0:
+        return None
     fade = np.linspace(0.0, 1.0, num_frames, endpoint=True, dtype=np.float32)
     return fade[:, None].repeat(channels, axis=1)
 
@@ -62,7 +83,8 @@ class AudioWorker(threading.Thread):
         self.monitor_local = bool(monitor_local)
 
     def _downmix_to_mono(self, x: np.ndarray) -> np.ndarray:
-        if x.ndim == 1 or x.shape[1] == 1: return x
+        if x.ndim == 1 or x.shape[1] == 1:
+            return x
         return np.mean(x, axis=1, keepdims=True)
 
     def _apply_limiter(self, x: np.ndarray, ceiling: float = 0.98) -> np.ndarray:
@@ -84,7 +106,8 @@ class AudioWorker(threading.Thread):
         return mic
 
     def _get_physical_mic(self, name_substring):
-        if not name_substring: return None
+        if not name_substring:
+            return None
         mics = sc.all_microphones(include_loopback=True)
         logger.debug(f"Microphones: {[m.name for m in mics]}")
         for m in mics:
@@ -112,22 +135,20 @@ class AudioWorker(threading.Thread):
                  out_spk.player(samplerate=self.sr, blocksize=self.block) as player, \
                  (mon_spk.player(samplerate=self.sr, blocksize=self.block) if mon_spk else _NullCtx()) as mon_player:
 
-                # Warm-up: descarta los primeros buffers (drivers pueden soltar basura)
+                # Warm-up: descarta buffers iniciales
                 for _ in range(WARMUP_BLOCKS):
                     _ = sys_rec.record(self.block)
 
-                # Preparar fade-in
+                # Fade-in al inicio
                 fade_frames = int(self.sr * (FADE_MS / 1000.0))
                 fade_left = fade_frames
-                chs = 1
-                # loop
+
                 while not self.stop_event.is_set():
                     sys_frames = sys_rec.record(self.block)  # float32 (N, ch)
                     sys_frames = sanitize(sys_frames)
+
                     if self.mono:
-                        sys_frames = self._downmix_to_mono(sys_frames); chs = 1
-                    else:
-                        chs = sys_frames.shape[1]
+                        sys_frames = self._downmix_to_mono(sys_frames)
 
                     sys_frames = sys_frames * self.sys_gain
 
@@ -139,9 +160,9 @@ class AudioWorker(threading.Thread):
                         # igualar canales
                         if sys_frames.shape[1] != mic_frames.shape[1]:
                             if sys_frames.shape[1] == 1 and mic_frames.shape[1] == 2:
-                                sys_frames = np.repeat(sys_frames, 2, axis=1); chs = 2
+                                sys_frames = np.repeat(sys_frames, 2, axis=1)
                             elif sys_frames.shape[1] == 2 and mic_frames.shape[1] == 1:
-                                mic_frames = np.repeat(mic_frames, 2, axis=1); chs = 2
+                                mic_frames = np.repeat(mic_frames, 2, axis=1)
                         mix = sys_frames + mic_frames * self.mic_gain
                     else:
                         mix = sys_frames
@@ -180,8 +201,10 @@ class MainWindow(QtWidgets.QMainWindow):
         super().__init__()
         self.setWindowTitle(APP_NAME)
         self.setMinimumSize(820, 520)
-        self.setWindowIcon(QtGui.QIcon("assets/app.ico") if Path("assets/app.ico").exists()
-                           else self.style().standardIcon(QtWidgets.QStyle.SP_MediaPlay))
+        self.setWindowIcon(
+            QtGui.QIcon("assets/app.ico") if Path("assets/app.ico").exists()
+            else self.style().standardIcon(QtWidgets.QStyle.SP_MediaPlay)
+        )
 
         self.worker: AudioWorker | None = None
         self.tray = None
@@ -239,12 +262,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.startRequested.connect(self.start_worker)
         self.stopRequested.connect(self.stop_worker)
 
-        # Tray
+        # Bandeja
         self._init_tray()
 
         # Carga y AUTOSTART
         self.populate_devices()
-        QtCore.QTimer.singleShot(400, self.autostart)  # arranca solo
+        QtCore.QTimer.singleShot(400, self.autostart)  # arranca solo al abrir
 
     def populate_devices(self):
         try:
@@ -282,7 +305,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "sys_gain": self.sys_gain_d.value(),
             "mic_gain": self.mic_gain_d.value(),
             "limiter": self.limiter_chk.isChecked(),
-            "monitor_local": False,  # para evitar feedback por defecto
+            "monitor_local": False,  # evita feedback por defecto
         }
         logger.info("Start solicitado por la app (auto/usuario).")
         self.startRequested.emit(cfg)
@@ -303,7 +326,8 @@ class MainWindow(QtWidgets.QMainWindow):
             if not self.is_running:
                 logger.error("El worker no quedó en ejecución. Revisa logs.")
                 QtWidgets.QMessageBox.critical(self, "Error", "No se pudo iniciar el audio. Revisa los logs.")
-                self.worker = None; return
+                self.worker = None
+                return
             self.start_btn.setEnabled(False); self.stop_btn.setEnabled(True)
             self._tray_set_tooltip(running=True)
             logger.info("Audio iniciado.")
@@ -357,12 +381,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.showNormal(); self.activateWindow(); self.raise_()
 
     def _tray_toggle(self):
-        if self.is_running: self._on_stop()
-        else: self._on_start()
+        if self.is_running:
+            self._on_stop()
+        else:
+            self._on_start()
 
     def _tray_quit(self):
         try:
-            if self.is_running: self.stop_worker()
+            if self.is_running:
+                self.stop_worker()
         finally:
             QtWidgets.QApplication.quit()
 
@@ -373,7 +400,8 @@ class MainWindow(QtWidgets.QMainWindow):
     # Cerrar → minimizar a bandeja
     def closeEvent(self, event: QtGui.QCloseEvent):
         if self.tray and self.tray.isVisible():
-            event.ignore(); self.hide()
+            event.ignore()
+            self.hide()
             self.tray.showMessage(APP_NAME, "Sigo ejecutándome en segundo plano.", QtWidgets.QSystemTrayIcon.Information, 2500)
         else:
             super().closeEvent(event)
@@ -391,3 +419,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
